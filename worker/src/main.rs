@@ -77,12 +77,12 @@ async fn main() -> Result<()> {
     // Initialize game logic (used when this node is leader)
     let mut game_logic = GameLogic::new(GameConfig::default());
 
-    // Initialize network manager (for packet flooding and metrics)
+    // Initialize network manager (for WebSocket attack connections and metrics)
     let network_manager = Arc::new(NetworkManager::new());
 
     // TODO: Auto-join the game or wait for manual join via API
-    // For now, NetworkManager will be initialized when the first PlayerJoin
-    // event for this worker is processed
+    // For now, NetworkManager will be initialized with node coord/capacity when the first
+    // PlayerJoin event for this worker is processed
 
     // Main loop - run game logic tick and show status
     let mut tick_count = 0;

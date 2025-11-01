@@ -2,12 +2,13 @@ use crate::game::{GameEvent, NodeCoord, Player, Node};
 use crate::raft::storage::{GameEventRequest, GameRaftTypeConfig};
 use anyhow::Result;
 use axum::{
-    extract::State,
+    extract::{State, WebSocketUpgrade},
     http::StatusCode,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
+use futures_util::SinkExt;
 use openraft::Raft;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -121,9 +122,11 @@ pub fn create_router(state: ApiState) -> Router {
         .route("/status", get(get_status))
         // Game command endpoints
         .route("/game/join", post(handle_join_game))
-        .route("/game/attack", post(handle_attack))
+        .route("/game/attack", post(handle_attack_command))
         .route("/game/stop-attack", post(handle_stop_attack))
         .route("/game/state", get(handle_get_game_state))
+        // WebSocket attack endpoint
+        .route("/attack", get(handle_attack))
         .with_state(state)
 }
 
@@ -286,7 +289,7 @@ async fn handle_join_game(
 }
 
 /// Handle attack command
-async fn handle_attack(
+async fn handle_attack_command(
     State(state): State<ApiState>,
     Json(req): Json<AttackRequest>,
 ) -> impl IntoResponse {
@@ -465,6 +468,39 @@ async fn handle_get_game_state(State(state): State<ApiState>) -> impl IntoRespon
     };
 
     (StatusCode::OK, Json(response))
+}
+
+/// Handle WebSocket upgrade for attack connections
+async fn handle_attack(ws: WebSocketUpgrade) -> Response {
+    ws.on_upgrade(|socket| handle_attack_websocket_axum(socket))
+}
+
+/// Handle WebSocket attack connection (Axum-specific)
+async fn handle_attack_websocket_axum(socket: axum::extract::ws::WebSocket) {
+    use axum::extract::ws::Message;
+    use futures_util::StreamExt;
+
+    println!("[Network] Incoming attack WebSocket connection");
+
+    let (mut sender, _receiver) = socket.split();
+    let flood_data = vec![0u8; 1024]; // 1KB per message
+
+    loop {
+        // Send data as fast as possible
+        match sender.send(Message::Binary(flood_data.clone())).await {
+            Ok(_) => {
+                // Data sent successfully, continue flooding
+            }
+            Err(_) => {
+                break;
+            }
+        }
+
+        // Small delay to avoid completely saturating the connection
+        tokio::time::sleep(std::time::Duration::from_micros(100)).await;
+    }
+
+    println!("[Network] Attack WebSocket connection closed");
 }
 
 /// Start the HTTP API server

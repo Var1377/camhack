@@ -6,5 +6,5 @@ pub mod state;
 
 pub use events::{GameEvent, NodeCoord, NodeType};
 pub use logic::{GameConfig, GameLogic};
-pub use network::{NetworkManager, GAME_UDP_PORT};
+pub use network::NetworkManager;
 pub use state::{GameState, Node, Player};

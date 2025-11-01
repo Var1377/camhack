@@ -16,138 +16,41 @@ pub struct PlayerContext {
 /// Client state shared across HTTP handlers
 #[derive(Clone)]
 pub struct ClientState {
-    pub raft_node: Arc<RaftNode>,
+    pub raft_node: Arc<RwLock<Option<Arc<RaftNode>>>>,
     pub player_context: Arc<RwLock<Option<PlayerContext>>>,
+    pub master_url: Arc<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     println!("=== CamHack Client Starting ===\n");
 
-    // Step 1: Generate client ID
-    let client_id = std::env::var("CLIENT_ID")
-        .unwrap_or_else(|_| format!("client-{}", std::process::id()));
-    println!("Client ID: {}", client_id);
+    // Get master URL from environment
+    let master_url = std::env::var("MASTER_URL")
+        .unwrap_or_else(|_| "http://localhost:8080".to_string());
+    println!("Master URL: {}", master_url);
 
-    // Step 2: Get own IP from ECS metadata
-    println!("\n[1/6] Discovering IP address from ECS metadata...");
-    let my_ip = worker::metadata::get_task_ip().await?;
-    println!("✓ IP address: {}", my_ip);
-
-    // Step 3: Get task ARN from ECS metadata
-    println!("\n[2/6] Getting task ARN from ECS metadata...");
-    let task_arn = worker::metadata::get_task_arn().await?;
-    println!("✓ Task ARN: {}", task_arn);
-
-    // Step 4: Get game ID from environment
-    let game_id = std::env::var("GAME_ID")
-        .unwrap_or_else(|_| "default-game".to_string());
-    println!("\n[3/7] Game ID: {}", game_id);
-
-    // Step 5: Register with master and get peer
-    println!("\n[4/7] Registering with master...");
-    let peer = worker::registry::register_and_get_peer(client_id.clone(), task_arn, my_ip.clone(), game_id).await?;
-
-    // Step 6: Initialize Raft node (same as worker)
-    println!("\n[5/7] Initializing Raft node...");
-    let node_id = generate_node_id();
-    let registry = NodeRegistry::new();
-
-    let raft_node = if let Some(peer_info) = peer {
-        // Join existing cluster
-        join_cluster(node_id, my_ip.clone(), peer_info, registry).await?
-    } else {
-        // Bootstrap new cluster
-        bootstrap_cluster(node_id, my_ip.clone(), registry).await?
-    };
-
-    // Step 7: Initialize local player
-    println!("\n[6/7] Initializing local player...");
-    let player_id = generate_player_id();
-    let player_name = std::env::var("PLAYER_NAME")
-        .unwrap_or_else(|_| format!("Player{}", player_id % 1000));
-
-    // Find a random unoccupied coordinate
-    let capital_coord = find_random_unoccupied_coord(&raft_node).await?;
-    println!("✓ Assigned capital position: ({}, {})", capital_coord.q, capital_coord.r);
-
-    // Submit PlayerJoin event to Raft cluster
-    let join_event = GameEvent::PlayerJoin {
-        player_id,
-        name: player_name.clone(),
-        capital_coord,
-        node_ip: my_ip.clone(),
-        timestamp: current_timestamp(),
-    };
-
-    println!("Submitting PlayerJoin event to cluster...");
-    let request = GameEventRequest { event: join_event };
-    match raft_node.raft.client_write(request).await {
-        Ok(response) => {
-            println!("✓ Player joined successfully at log index {}", response.log_id.index);
-        }
-        Err(e) => {
-            eprintln!("Failed to join game: {}", e);
-            return Err(e.into());
-        }
-    }
-
-    // Store player context
-    let player_context = Arc::new(RwLock::new(Some(PlayerContext {
-        player_id,
-        player_name: player_name.clone(),
-        capital_coord,
-    })));
-
-    // Step 8: Start HTTP API server for player actions
-    println!("\n[7/7] Starting HTTP API server...");
+    // Create client state with no initial Raft node or player
     let client_state = ClientState {
-        raft_node: raft_node.clone(),
-        player_context: player_context.clone(),
+        raft_node: Arc::new(RwLock::new(None)),
+        player_context: Arc::new(RwLock::new(None)),
+        master_url: Arc::new(master_url),
     };
 
+    // Start HTTP API server
+    println!("\nStarting HTTP API server...");
     let api_addr = "0.0.0.0:8080";
-    tokio::spawn(async move {
-        if let Err(e) = start_api_server(client_state, api_addr.to_string()).await {
-            eprintln!("HTTP API server error: {}", e);
-        }
-    });
 
     println!("\n=== Client Ready ===");
-    println!("  Client ID: {}", client_id);
-    println!("  Node ID: {}", node_id);
-    println!("  Player ID: {}", player_id);
-    println!("  Player Name: {}", player_name);
-    println!("  Capital: ({}, {})", capital_coord.q, capital_coord.r);
-    println!("  IP: {}", my_ip);
-    println!("  Raft Port: 5000");
     println!("  HTTP API Port: 8080");
+    println!("  Status: Not joined to any game");
+    println!("  Call POST /join to join a game");
     println!("===================\n");
 
-    // Main loop - show status periodically
-    let mut tick_count = 0;
-    loop {
-        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-        tick_count += 1;
+    // Start server and block
+    start_api_server(client_state, api_addr.to_string()).await?;
 
-        let is_leader = raft_node.is_leader().await;
-        let storage = raft_node.storage.read().await;
-        let state_machine_arc = storage.state_machine();
-        drop(storage);
-        let sm = state_machine_arc.read().await;
-
-        // Get player-specific stats
-        let player = sm.game_state.players.get(&player_id);
-        let owned_nodes_count = sm.game_state.get_player_nodes(player_id).len();
-        let is_alive = player.map(|p| p.alive).unwrap_or(false);
-
-        drop(sm);
-
-        println!(
-            "[Tick {}] {} | Leader: {} | Alive: {} | Nodes: {}",
-            tick_count, player_name, is_leader, is_alive, owned_nodes_count
-        );
-    }
+    Ok(())
 }
 
 /// Generate a unique player ID
@@ -239,11 +142,17 @@ async fn start_api_server(state: ClientState, addr: String) -> Result<()> {
     // GET /my/status - Get local player status
     async fn get_player_status(
         State(state): State<ClientState>,
-    ) -> Json<PlayerStatusResponse> {
-        let player_ctx = state.player_context.read().await;
-        let ctx = player_ctx.as_ref().unwrap();
+    ) -> Result<Json<PlayerStatusResponse>, String> {
+        // Check if joined
+        let raft_node = state.raft_node.read().await;
+        let raft_node = raft_node.as_ref()
+            .ok_or("Not joined to any game. Call POST /join first".to_string())?;
 
-        let storage = state.raft_node.storage.read().await;
+        let player_ctx = state.player_context.read().await;
+        let ctx = player_ctx.as_ref()
+            .ok_or("Player context not initialized".to_string())?;
+
+        let storage = raft_node.storage.read().await;
         let sm_arc = storage.state_machine();
         drop(storage);
         let sm = sm_arc.read().await;
@@ -251,25 +160,32 @@ async fn start_api_server(state: ClientState, addr: String) -> Result<()> {
         let player = sm.game_state.players.get(&ctx.player_id);
         let owned_nodes = sm.game_state.get_player_nodes(ctx.player_id);
         let is_alive = player.map(|p| p.alive).unwrap_or(false);
+        let is_leader = raft_node.is_leader().await;
 
-        Json(PlayerStatusResponse {
+        Ok(Json(PlayerStatusResponse {
             player_id: ctx.player_id,
             player_name: ctx.player_name.clone(),
             capital_coord: ctx.capital_coord,
             alive: is_alive,
             owned_nodes: owned_nodes.len(),
-            is_leader: state.raft_node.is_leader().await,
-        })
+            is_leader,
+        }))
     }
 
     // GET /my/nodes - Get all nodes owned by local player
     async fn get_player_nodes(
         State(state): State<ClientState>,
-    ) -> Json<Vec<NodeInfo>> {
-        let player_ctx = state.player_context.read().await;
-        let ctx = player_ctx.as_ref().unwrap();
+    ) -> Result<Json<Vec<NodeInfo>>, String> {
+        // Check if joined
+        let raft_node = state.raft_node.read().await;
+        let raft_node = raft_node.as_ref()
+            .ok_or("Not joined to any game. Call POST /join first".to_string())?;
 
-        let storage = state.raft_node.storage.read().await;
+        let player_ctx = state.player_context.read().await;
+        let ctx = player_ctx.as_ref()
+            .ok_or("Player context not initialized".to_string())?;
+
+        let storage = raft_node.storage.read().await;
         let sm_arc = storage.state_machine();
         drop(storage);
         let sm = sm_arc.read().await;
@@ -285,7 +201,7 @@ async fn start_api_server(state: ClientState, addr: String) -> Result<()> {
             })
             .collect();
 
-        Json(node_infos)
+        Ok(Json(node_infos))
     }
 
     // POST /my/attack - Set attack target for a node
@@ -293,8 +209,15 @@ async fn start_api_server(state: ClientState, addr: String) -> Result<()> {
         State(state): State<ClientState>,
         Json(req): Json<AttackRequest>,
     ) -> Result<Json<String>, String> {
+        // Check if joined
+        let raft_node = state.raft_node.read().await;
+        let raft_node = raft_node.as_ref()
+            .ok_or("Not joined to any game. Call POST /join first".to_string())?;
+
         let player_ctx = state.player_context.read().await;
-        let ctx = player_ctx.as_ref().unwrap();
+        let ctx = player_ctx.as_ref()
+            .ok_or("Player context not initialized".to_string())?;
+
         let target_coord = NodeCoord::new(req.target_q, req.target_r);
 
         // If no node specified, use the capital
@@ -305,7 +228,7 @@ async fn start_api_server(state: ClientState, addr: String) -> Result<()> {
         };
 
         // Verify player owns the node
-        let storage = state.raft_node.storage.read().await;
+        let storage = raft_node.storage.read().await;
         let sm_arc = storage.state_machine();
         drop(storage);
         let sm = sm_arc.read().await;
@@ -328,7 +251,7 @@ async fn start_api_server(state: ClientState, addr: String) -> Result<()> {
         };
 
         let request = GameEventRequest { event };
-        match state.raft_node.raft.client_write(request).await {
+        match raft_node.raft.client_write(request).await {
             Ok(_) => Ok(Json("Attack target set successfully".to_string())),
             Err(e) => Err(format!("Failed to set attack target: {}", e)),
         }
@@ -353,14 +276,32 @@ async fn start_api_server(state: ClientState, addr: String) -> Result<()> {
             latest_event: Option<String>,
         }
 
+        // Check if joined
+        {
+            let raft_node = state.raft_node.read().await;
+            if raft_node.is_none() {
+                let _ = socket.send(Message::Text(
+                    serde_json::json!({"error": "Not joined to any game. Call POST /join first"}).to_string()
+                )).await;
+                let _ = socket.close().await;
+                return;
+            }
+        }
+
         let mut last_log_index = 0u64;
         let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(500));
 
         loop {
             tokio::select! {
                 _ = interval.tick() => {
+                    // Check if still joined
+                    let raft_node_guard = state.raft_node.read().await;
+                    let Some(raft_node) = raft_node_guard.as_ref() else {
+                        break;
+                    };
+
                     // Get current state
-                    let storage = state.raft_node.storage.read().await;
+                    let storage = raft_node.storage.read().await;
                     let sm_arc = storage.state_machine();
                     drop(storage);
                     let sm = sm_arc.read().await;
@@ -406,8 +347,134 @@ async fn start_api_server(state: ClientState, addr: String) -> Result<()> {
         }
     }
 
+    // GET /discover - Discover available games from master
+    async fn discover_games(
+        State(state): State<ClientState>,
+    ) -> Result<Json<serde_json::Value>, String> {
+        let client = reqwest::Client::new();
+        let master_url = state.master_url.as_str();
+
+        let response = client
+            .get(format!("{}/games", master_url))
+            .send()
+            .await
+            .map_err(|e| format!("Failed to contact master: {}", e))?
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+        Ok(Json(response))
+    }
+
+    // GET /status - Get client join status
+    async fn get_status(
+        State(state): State<ClientState>,
+    ) -> Json<serde_json::Value> {
+        let player_ctx = state.player_context.read().await;
+        let raft_node = state.raft_node.read().await;
+
+        if let (Some(ctx), Some(_)) = (player_ctx.as_ref(), raft_node.as_ref()) {
+            serde_json::json!({
+                "joined": true,
+                "player_id": ctx.player_id,
+                "player_name": ctx.player_name,
+                "capital_coord": { "q": ctx.capital_coord.q, "r": ctx.capital_coord.r }
+            })
+        } else {
+            serde_json::json!({
+                "joined": false
+            })
+        }.into()
+    }
+
+    // POST /join - Join a game
+    #[derive(Deserialize)]
+    struct JoinRequest {
+        game_id: String,
+        player_name: String,
+    }
+
+    async fn join_game(
+        State(state): State<ClientState>,
+        Json(req): Json<JoinRequest>,
+    ) -> Result<Json<String>, String> {
+        // Check if already joined
+        {
+            let raft_node = state.raft_node.read().await;
+            if raft_node.is_some() {
+                return Err("Already joined to a game".to_string());
+            }
+        }
+
+        println!("\n=== Joining Game: {} ===", req.game_id);
+
+        // Get client ID
+        let client_id = std::env::var("CLIENT_ID")
+            .unwrap_or_else(|_| format!("client-{}", std::process::id()));
+
+        // Get IP and task ARN from ECS metadata
+        let my_ip = worker::metadata::get_task_ip().await
+            .map_err(|e| format!("Failed to get IP: {}", e))?;
+        let task_arn = worker::metadata::get_task_arn().await
+            .map_err(|e| format!("Failed to get task ARN: {}", e))?;
+
+        // Register with master and get peer
+        let peer = worker::registry::register_and_get_peer(
+            client_id,
+            task_arn,
+            my_ip.clone(),
+            req.game_id.clone(),
+        ).await
+            .map_err(|e| format!("Failed to register with master: {}", e))?;
+
+        // Initialize Raft node
+        let node_id = generate_node_id();
+        let registry = NodeRegistry::new();
+
+        let raft_node = if let Some(peer_info) = peer {
+            join_cluster(node_id, my_ip.clone(), peer_info, registry).await
+        } else {
+            bootstrap_cluster(node_id, my_ip.clone(), registry).await
+        }.map_err(|e| format!("Failed to initialize Raft: {}", e))?;
+
+        // Initialize player
+        let player_id = generate_player_id();
+        let capital_coord = find_random_unoccupied_coord(&raft_node).await
+            .map_err(|e| format!("Failed to find capital position: {}", e))?;
+
+        // Submit PlayerJoin event
+        let join_event = GameEvent::PlayerJoin {
+            player_id,
+            name: req.player_name.clone(),
+            capital_coord,
+            node_ip: my_ip,
+            timestamp: current_timestamp(),
+        };
+
+        let event_request = GameEventRequest { event: join_event };
+        raft_node.raft.client_write(event_request).await
+            .map_err(|e| format!("Failed to submit join event: {}", e))?;
+
+        // Store state
+        let player_ctx = PlayerContext {
+            player_id,
+            player_name: req.player_name.clone(),
+            capital_coord,
+        };
+
+        *state.player_context.write().await = Some(player_ctx);
+        *state.raft_node.write().await = Some(raft_node);
+
+        println!("✓ Successfully joined game: {}", req.game_id);
+
+        Ok(Json(format!("Successfully joined game {} as {}", req.game_id, req.player_name)))
+    }
+
     // Build router
     let app = Router::new()
+        .route("/discover", get(discover_games))
+        .route("/status", get(get_status))
+        .route("/join", post(join_game))
         .route("/my/status", get(get_player_status))
         .route("/my/nodes", get(get_player_nodes))
         .route("/my/attack", post(set_attack_target))

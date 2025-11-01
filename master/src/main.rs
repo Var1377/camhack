@@ -23,6 +23,8 @@ struct WorkerInfo {
 struct GameCluster {
     game_id: String,
     workers: HashMap<String, WorkerInfo>, // worker_id -> WorkerInfo
+    #[serde(skip_serializing)]
+    created_at: std::time::SystemTime,
 }
 
 #[derive(Clone)]
@@ -87,6 +89,18 @@ struct GetPeerResponse {
     peer_port: Option<u16>,
 }
 
+#[derive(Serialize)]
+struct GameInfo {
+    game_id: String,
+    worker_count: usize,
+    created_at_secs: u64,
+}
+
+#[derive(Serialize)]
+struct GetGamesResponse {
+    games: Vec<GameInfo>,
+}
+
 #[tokio::main]
 async fn main() {
     println!("Master node starting...");
@@ -127,6 +141,7 @@ async fn main() {
         .route("/status", get(status))
         .route("/register_worker", post(register_worker))
         .route("/get_peer", get(get_peer))
+        .route("/games", get(get_games))
         .with_state(state);
 
     // Start HTTP server
@@ -140,11 +155,12 @@ async fn main() {
     println!("Endpoints:");
     println!("  GET  /                - Health check");
     println!("  GET  /status          - Show active workers");
-    println!("  POST /spawn_workers?count=N - Spawn N workers");
+    println!("  GET  /games           - List all available games");
+    println!("  POST /spawn_workers?count=N&game_id=X - Spawn N workers for game X");
     println!("  POST /kill_workers    - Kill all workers");
     println!("  POST /kill            - Kill master (self)");
     println!("  POST /register_worker - Register worker with master");
-    println!("  GET  /get_peer        - Get a peer for joining cluster");
+    println!("  GET  /get_peer?game_id=X - Get a peer for joining cluster");
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
@@ -360,6 +376,7 @@ async fn register_worker(
         GameCluster {
             game_id: payload.game_id.clone(),
             workers: HashMap::new(),
+            created_at: std::time::SystemTime::now(),
         }
     });
 
@@ -415,5 +432,31 @@ async fn get_peer(
     Json(GetPeerResponse {
         peer_ip: None,
         peer_port: None,
+    })
+}
+
+async fn get_games(State(state): State<AppState>) -> impl IntoResponse {
+    let games = state.games.read().await;
+
+    let game_infos: Vec<GameInfo> = games.values()
+        .map(|game_cluster| {
+            // Convert SystemTime to seconds since UNIX_EPOCH
+            let created_at_secs = game_cluster.created_at
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+
+            GameInfo {
+                game_id: game_cluster.game_id.clone(),
+                worker_count: game_cluster.workers.len(),
+                created_at_secs,
+            }
+        })
+        .collect();
+
+    println!("Returning {} active games", game_infos.len());
+
+    Json(GetGamesResponse {
+        games: game_infos,
     })
 }
