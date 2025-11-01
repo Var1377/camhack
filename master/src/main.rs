@@ -32,6 +32,7 @@ struct AppState {
     ecs_client: EcsClient,
     cluster_name: String,
     task_definition: String,
+    capital_task_definition: String,  // 2x CPU/memory for capitals
     subnet_id: String,
     security_group_id: String,
     games: Arc<RwLock<HashMap<String, GameCluster>>>, // game_id -> GameCluster
@@ -42,6 +43,7 @@ struct AppState {
 struct SpawnQuery {
     count: Option<u32>,
     game_id: Option<String>,
+    is_capital: Option<bool>,  // Spawn capital nodes with 2x resources
 }
 
 #[derive(Serialize)]
@@ -101,6 +103,21 @@ struct GetGamesResponse {
     games: Vec<GameInfo>,
 }
 
+#[derive(Deserialize)]
+struct SpawnSingleNodeRequest {
+    game_id: String,
+    is_capital: bool,
+    q: i32,  // Node coordinate q
+    r: i32,  // Node coordinate r
+}
+
+#[derive(Serialize)]
+struct SpawnSingleNodeResponse {
+    message: String,
+    task_arn: Option<String>,
+    coord: String,
+}
+
 #[tokio::main]
 async fn main() {
     println!("Master node starting...");
@@ -114,6 +131,8 @@ async fn main() {
         .unwrap_or_else(|_| "udp-test-cluster".to_string());
     let task_definition = std::env::var("WORKER_TASK_DEFINITION")
         .unwrap_or_else(|_| "worker".to_string());
+    let capital_task_definition = std::env::var("CAPITAL_TASK_DEFINITION")
+        .unwrap_or_else(|_| "worker-capital".to_string());
     let subnet_id = std::env::var("SUBNET_ID")
         .expect("SUBNET_ID environment variable required");
     let security_group_id = std::env::var("SECURITY_GROUP_ID")
@@ -126,6 +145,7 @@ async fn main() {
         ecs_client,
         cluster_name,
         task_definition,
+        capital_task_definition,
         subnet_id,
         security_group_id,
         games: Arc::new(RwLock::new(HashMap::new())),
@@ -136,6 +156,7 @@ async fn main() {
     let app = Router::new()
         .route("/", get(health_check))
         .route("/spawn_workers", post(spawn_workers))
+        .route("/spawn_single_node", post(spawn_single_node))
         .route("/kill_workers", post(kill_workers))
         .route("/kill", post(kill_self))
         .route("/status", get(status))
@@ -196,16 +217,29 @@ async fn spawn_workers(
 ) -> impl IntoResponse {
     let count = params.count.unwrap_or(1);
     let game_id = params.game_id.unwrap_or_else(|| "default-game".to_string());
+    let is_capital = params.is_capital.unwrap_or(false);
 
-    println!("Spawning {} workers for game {}...", count, game_id);
+    println!(
+        "Spawning {} {} workers for game {}...",
+        count,
+        if is_capital { "capital" } else { "regular" },
+        game_id
+    );
 
     let mut spawned_arns = Vec::new();
+
+    // Select task definition based on whether it's a capital
+    let task_def = if is_capital {
+        &state.capital_task_definition
+    } else {
+        &state.task_definition
+    };
 
     // Build task overrides to set GAME_ID environment variable
     let mut task_override = aws_sdk_ecs::types::TaskOverride::builder();
 
     let container_override = aws_sdk_ecs::types::ContainerOverride::builder()
-        .name("worker") // Container name from task definition
+        .name(if is_capital { "udp-node-capital" } else { "udp-node" })
         .environment(
             aws_sdk_ecs::types::KeyValuePair::builder()
                 .name("GAME_ID")
@@ -221,7 +255,7 @@ async fn spawn_workers(
         .ecs_client
         .run_task()
         .cluster(&state.cluster_name)
-        .task_definition(&state.task_definition)
+        .task_definition(task_def)
         .count(count as i32)
         .launch_type(aws_sdk_ecs::types::LaunchType::Fargate)
         .network_configuration(
@@ -270,6 +304,113 @@ async fn spawn_workers(
                     message: format!("Failed to spawn workers: {}", e),
                     spawned_count: 0,
                     task_arns: vec![],
+                }),
+            )
+        }
+    }
+}
+
+async fn spawn_single_node(
+    State(state): State<AppState>,
+    Json(payload): Json<SpawnSingleNodeRequest>,
+) -> impl IntoResponse {
+    let coord_str = format!("({}, {})", payload.q, payload.r);
+    println!(
+        "Spawning single {} node at {} for game {}...",
+        if payload.is_capital { "capital" } else { "regular" },
+        coord_str,
+        payload.game_id
+    );
+
+    // Select task definition based on whether it's a capital
+    let task_def = if payload.is_capital {
+        &state.capital_task_definition
+    } else {
+        &state.task_definition
+    };
+
+    // Build task overrides to set GAME_ID and NODE_COORD environment variables
+    let container_override = aws_sdk_ecs::types::ContainerOverride::builder()
+        .name(if payload.is_capital { "udp-node-capital" } else { "udp-node" })
+        .environment(
+            aws_sdk_ecs::types::KeyValuePair::builder()
+                .name("GAME_ID")
+                .value(&payload.game_id)
+                .build()
+        )
+        .environment(
+            aws_sdk_ecs::types::KeyValuePair::builder()
+                .name("NODE_COORD_Q")
+                .value(payload.q.to_string())
+                .build()
+        )
+        .environment(
+            aws_sdk_ecs::types::KeyValuePair::builder()
+                .name("NODE_COORD_R")
+                .value(payload.r.to_string())
+                .build()
+        )
+        .build();
+
+    let task_override = aws_sdk_ecs::types::TaskOverride::builder()
+        .container_overrides(container_override)
+        .build();
+
+    // Spawn single task
+    match state
+        .ecs_client
+        .run_task()
+        .cluster(&state.cluster_name)
+        .task_definition(task_def)
+        .count(1)
+        .launch_type(aws_sdk_ecs::types::LaunchType::Fargate)
+        .network_configuration(
+            aws_sdk_ecs::types::NetworkConfiguration::builder()
+                .awsvpc_configuration(
+                    aws_sdk_ecs::types::AwsVpcConfiguration::builder()
+                        .subnets(&state.subnet_id)
+                        .security_groups(&state.security_group_id)
+                        .assign_public_ip(aws_sdk_ecs::types::AssignPublicIp::Enabled)
+                        .build()
+                        .unwrap(),
+                )
+                .build(),
+        )
+        .overrides(task_override)
+        .send()
+        .await
+    {
+        Ok(response) => {
+            let task_arn = response
+                .tasks
+                .and_then(|tasks| tasks.first().and_then(|task| task.task_arn.clone()));
+
+            if let Some(ref arn) = task_arn {
+                println!("Spawned single node: {}", arn);
+            }
+
+            (
+                StatusCode::OK,
+                Json(SpawnSingleNodeResponse {
+                    message: format!(
+                        "Successfully spawned {} node at {} for game {}",
+                        if payload.is_capital { "capital" } else { "regular" },
+                        coord_str,
+                        payload.game_id
+                    ),
+                    task_arn,
+                    coord: coord_str,
+                }),
+            )
+        }
+        Err(e) => {
+            eprintln!("Failed to spawn single node: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(SpawnSingleNodeResponse {
+                    message: format!("Failed to spawn node: {}", e),
+                    task_arn: None,
+                    coord: coord_str,
                 }),
             )
         }

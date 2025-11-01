@@ -127,8 +127,7 @@ async fn start_api_server(state: ClientState, addr: String) -> Result<()> {
     struct NodeInfo {
         coord: NodeCoord,
         node_type: String,
-        capacity: u64,
-        current_target: Option<NodeCoord>,
+        current_target: Option<String>,
     }
 
     #[derive(Deserialize)]
@@ -196,8 +195,7 @@ async fn start_api_server(state: ClientState, addr: String) -> Result<()> {
             .map(|node| NodeInfo {
                 coord: node.coord,
                 node_type: format!("{:?}", node.node_type),
-                capacity: node.capacity,
-                current_target: node.current_target,
+                current_target: node.current_target.as_ref().map(|t| format!("{:?}", t)),
             })
             .collect();
 
@@ -241,12 +239,18 @@ async fn start_api_server(state: ClientState, addr: String) -> Result<()> {
             return Err("Node not found".to_string());
         }
 
+        // Check adjacency - target must be adjacent to attacking node
+        if !node_coord.is_adjacent(&target_coord) {
+            drop(sm);
+            return Err("Target must be adjacent to your node".to_string());
+        }
+
         drop(sm);
 
         // Submit SetNodeTarget event
         let event = GameEvent::SetNodeTarget {
             node_coord,
-            target_coord: Some(target_coord),
+            target: Some(worker::game::AttackTarget::Coordinate(target_coord)),
             timestamp: current_timestamp(),
         };
 
@@ -448,6 +452,7 @@ async fn start_api_server(state: ClientState, addr: String) -> Result<()> {
             name: req.player_name.clone(),
             capital_coord,
             node_ip: my_ip,
+            is_client: true,  // This is a client (player's laptop)
             timestamp: current_timestamp(),
         };
 
@@ -470,6 +475,41 @@ async fn start_api_server(state: ClientState, addr: String) -> Result<()> {
         Ok(Json(format!("Successfully joined game {} as {}", req.game_id, req.player_name)))
     }
 
+    // WebSocket handler for final kill attacks (10-second client kill)
+    async fn finalkill_handler(
+        State(_state): State<ClientState>,
+        ws: WebSocketUpgrade,
+    ) -> Response {
+        ws.on_upgrade(handle_finalkill_websocket)
+    }
+
+    async fn handle_finalkill_websocket(mut socket: WebSocket) {
+        println!("[FinalKill] Attacker connected, receiving flood data...");
+        let mut bytes_received = 0u64;
+
+        // Receive data until connection closes
+        while let Some(msg) = socket.recv().await {
+            match msg {
+                Ok(Message::Binary(data)) => {
+                    bytes_received += data.len() as u64;
+                }
+                Ok(Message::Close(_)) => {
+                    println!("[FinalKill] Connection closed, total bytes: {}", bytes_received);
+                    break;
+                }
+                Ok(_) => {
+                    // Ignore other message types
+                }
+                Err(e) => {
+                    eprintln!("[FinalKill] Error receiving: {}", e);
+                    break;
+                }
+            }
+        }
+
+        println!("[FinalKill] Disconnected, total received: {} bytes", bytes_received);
+    }
+
     // Build router
     let app = Router::new()
         .route("/discover", get(discover_games))
@@ -479,6 +519,7 @@ async fn start_api_server(state: ClientState, addr: String) -> Result<()> {
         .route("/my/nodes", get(get_player_nodes))
         .route("/my/attack", post(set_attack_target))
         .route("/ws", get(websocket_handler))
+        .route("/finalkill", get(finalkill_handler))
         .with_state(state);
 
     // Start server

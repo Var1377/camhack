@@ -329,6 +329,7 @@ mod tests {
             name: "Alice".to_string(),
             capital_coord: NodeCoord::new(0, 0),
             node_ip: "10.0.0.1".to_string(),
+            is_client: false,
             timestamp: 1234567890,
         };
 

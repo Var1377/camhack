@@ -1,4 +1,4 @@
-use super::events::{GameEvent, NodeCoord, NodeType};
+use super::events::{AttackTarget, GameEvent, NodeCoord, NodeType};
 use std::collections::HashMap;
 
 /// Player state
@@ -11,14 +11,25 @@ pub struct Player {
     pub join_time: u64,
 }
 
+/// Node initialization state
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeInitState {
+    /// EC2 task is spawning, no IP available yet
+    Initializing,
+    /// EC2 instance is running and has IP address
+    Ready,
+}
+
 /// Node on the grid
+/// Capacity is determined by actual EC2 instance type, not hardcoded
 #[derive(Debug, Clone)]
 pub struct Node {
     pub coord: NodeCoord,
     pub owner_id: u64,
     pub node_type: NodeType,
-    pub capacity: u64,  // bytes/sec bandwidth capacity
-    pub current_target: Option<NodeCoord>,  // What this node is attacking
+    pub current_target: Option<AttackTarget>,  // What this node is attacking
+    pub is_client: bool,  // true if this is a client node
+    pub init_state: NodeInitState,  // Whether EC2 is ready
 }
 
 /// Metrics for a node at a point in time
@@ -49,8 +60,12 @@ pub struct GameState {
     pub node_metrics: HashMap<NodeCoord, NodeMetrics>,
     /// IP addresses of nodes (coord -> IP)
     pub node_ips: HashMap<NodeCoord, String>,
+    /// IP addresses of client nodes (player_id -> IP)
+    pub client_ips: HashMap<u64, String>,
     /// Last applied log index
     pub last_applied_log_index: u64,
+    /// Game is over (only one player remaining)
+    pub game_over: bool,
 }
 
 impl GameState {
@@ -60,7 +75,9 @@ impl GameState {
             nodes: HashMap::new(),
             node_metrics: HashMap::new(),
             node_ips: HashMap::new(),
+            client_ips: HashMap::new(),
             last_applied_log_index: 0,
+            game_over: false,
         }
     }
 
@@ -74,6 +91,7 @@ impl GameState {
                 name,
                 capital_coord,
                 node_ip,
+                is_client,
                 timestamp,
             } => {
                 // Create player
@@ -86,27 +104,33 @@ impl GameState {
                 };
                 self.players.insert(player_id, player);
 
-                // Create capital node
+                // Create capital node (capacity determined by EC2 instance type)
                 let capital = Node {
                     coord: capital_coord,
                     owner_id: player_id,
-                    node_type: NodeType::Capital,
-                    capacity: 10_000_000,  // 10 MB/s for capital (larger EC2)
+                    node_type: if is_client { NodeType::Client } else { NodeType::Capital },
                     current_target: None,
+                    is_client,
+                    init_state: NodeInitState::Ready,  // Has EC2 already
                 };
                 self.nodes.insert(capital_coord, capital);
 
                 // Store IP address
-                self.node_ips.insert(capital_coord, node_ip);
+                self.node_ips.insert(capital_coord, node_ip.clone());
+
+                // If this is a client node, also store in client_ips map
+                if is_client {
+                    self.client_ips.insert(player_id, node_ip);
+                }
             }
 
             GameEvent::SetNodeTarget {
                 node_coord,
-                target_coord,
+                target,
                 ..
             } => {
                 if let Some(node) = self.nodes.get_mut(&node_coord) {
-                    node.current_target = target_coord;
+                    node.current_target = target.clone();
                 }
             }
 
@@ -127,8 +151,14 @@ impl GameState {
                         }
 
                         // Convert capital to regular node for new owner
+                        // (EC2 instance stays the same size - still has capital-level resources)
                         node.node_type = NodeType::Regular;
-                        node.capacity = 1_000_000;  // 1 MB/s for regular node
+
+                        // Check if only one player remains (game over)
+                        let alive_count = self.players.values().filter(|p| p.alive).count();
+                        if alive_count <= 1 {
+                            self.game_over = true;
+                        }
                     }
                 }
             }
@@ -146,6 +176,35 @@ impl GameState {
                 };
                 self.node_metrics.insert(node_coord, metrics);
             }
+
+            GameEvent::NodeInitializationStarted {
+                node_coord,
+                owner_id,
+                ..
+            } => {
+                // Create placeholder node in Initializing state
+                let node = Node {
+                    coord: node_coord,
+                    owner_id,
+                    node_type: NodeType::Regular,  // Lazily initialized nodes are regular
+                    current_target: None,
+                    is_client: false,
+                    init_state: NodeInitState::Initializing,
+                };
+                self.nodes.insert(node_coord, node);
+            }
+
+            GameEvent::NodeInitializationComplete {
+                node_coord,
+                node_ip,
+                ..
+            } => {
+                // Update node to Ready state and store IP
+                if let Some(node) = self.nodes.get_mut(&node_coord) {
+                    node.init_state = NodeInitState::Ready;
+                }
+                self.node_ips.insert(node_coord, node_ip);
+            }
         }
     }
 
@@ -154,7 +213,7 @@ impl GameState {
         let mut attacks = Vec::new();
 
         for node in self.nodes.values() {
-            if let Some(target_coord) = node.current_target {
+            if let Some(AttackTarget::Coordinate(target_coord)) = node.current_target {
                 if let Some(target_node) = self.nodes.get(&target_coord) {
                     attacks.push(Attack {
                         attacker_node: node.coord,
@@ -169,25 +228,6 @@ impl GameState {
         attacks
     }
 
-    /// Check if a player can attack a target (must own adjacent node)
-    pub fn can_attack(&self, player_id: u64, target: NodeCoord) -> bool {
-        // Check if target exists
-        if !self.nodes.contains_key(&target) {
-            return false;
-        }
-
-        // Check if player owns any adjacent node
-        for neighbor_coord in target.neighbors() {
-            if let Some(neighbor) = self.nodes.get(&neighbor_coord) {
-                if neighbor.owner_id == player_id {
-                    return true;
-                }
-            }
-        }
-
-        false
-    }
-
     /// Get all nodes owned by a player
     pub fn get_player_nodes(&self, player_id: u64) -> Vec<&Node> {
         self.nodes
@@ -196,20 +236,8 @@ impl GameState {
             .collect()
     }
 
-    /// Get bandwidth being sent to a target node (sum of all attackers)
-    pub fn get_incoming_bandwidth(&self, target: NodeCoord) -> HashMap<NodeCoord, u64> {
-        let mut bandwidth_per_attacker = HashMap::new();
-
-        // Find all nodes attacking this target
-        for node in self.nodes.values() {
-            if node.current_target == Some(target) {
-                // Estimate bandwidth: use node's capacity as max output
-                bandwidth_per_attacker.insert(node.coord, node.capacity);
-            }
-        }
-
-        bandwidth_per_attacker
-    }
+    // Note: Bandwidth is now measured via actual UDP/ACK metrics,
+    // not estimated from capacity
 }
 
 impl Default for GameState {
@@ -230,6 +258,7 @@ mod tests {
             name: "Alice".to_string(),
             capital_coord: NodeCoord::new(0, 0),
             node_ip: "10.0.0.1".to_string(),
+            is_client: false,
             timestamp: 1000,
         };
 
@@ -251,6 +280,7 @@ mod tests {
                 name: "Alice".to_string(),
                 capital_coord: NodeCoord::new(0, 0),
                 node_ip: "10.0.0.1".to_string(),
+                is_client: false,
                 timestamp: 1000,
             },
             1,
@@ -261,6 +291,7 @@ mod tests {
                 name: "Bob".to_string(),
                 capital_coord: NodeCoord::new(1, 0),
                 node_ip: "10.0.0.2".to_string(),
+                is_client: false,
                 timestamp: 1001,
             },
             2,

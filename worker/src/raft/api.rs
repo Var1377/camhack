@@ -1,4 +1,5 @@
 use crate::game::{GameEvent, NodeCoord, Player, Node};
+use crate::game::events::AttackTarget;
 use crate::raft::storage::{GameEventRequest, GameRaftTypeConfig};
 use anyhow::Result;
 use axum::{
@@ -18,6 +19,8 @@ use std::sync::Arc;
 pub struct ApiState {
     pub raft: Arc<Raft<GameRaftTypeConfig>>,
     pub storage: Arc<tokio::sync::RwLock<crate::raft::storage::MemStorage>>,
+    pub master_url: String,
+    pub game_id: String,
 }
 
 /// Request to submit a new game event
@@ -110,7 +113,7 @@ pub struct PlayerInfo {
 pub struct NodeInfo {
     pub coord: NodeCoord,
     pub owner_id: u64,
-    pub current_target: Option<NodeCoord>,
+    pub current_target: Option<AttackTarget>,
 }
 
 /// Create the HTTP API router
@@ -261,6 +264,7 @@ async fn handle_join_game(
         name: req.player_name.clone(),
         capital_coord,
         node_ip: req.node_ip,
+        is_client: false,  // Worker node, not client
         timestamp,
     };
 
@@ -318,15 +322,6 @@ async fn handle_attack_command(
         return (StatusCode::BAD_REQUEST, Json(response));
     }
 
-    if !sm.game_state.nodes.contains_key(&req.target_coord) {
-        drop(sm);
-        let response = CommandResponse {
-            success: false,
-            message: format!("Target node {:?} does not exist", req.target_coord),
-        };
-        return (StatusCode::BAD_REQUEST, Json(response));
-    }
-
     // Check if they're neighbors
     if !req.node_coord.is_adjacent(&req.target_coord) {
         drop(sm);
@@ -337,7 +332,62 @@ async fn handle_attack_command(
         return (StatusCode::BAD_REQUEST, Json(response));
     }
 
-    drop(sm);
+    // If target doesn't exist, trigger lazy initialization
+    if !sm.game_state.nodes.contains_key(&req.target_coord) {
+        println!("[Lazy Init] Target {:?} doesn't exist, initializing neighbors...", req.target_coord);
+
+        // Get all 6 neighbors of the target
+        let neighbors = req.target_coord.neighbors();
+        let mut nodes_to_init = Vec::new();
+
+        // Find neighbors that don't exist in game state
+        for neighbor in &neighbors {
+            if !sm.game_state.nodes.contains_key(neighbor) {
+                nodes_to_init.push(*neighbor);
+            }
+        }
+
+        println!("[Lazy Init] Found {} uninitialized neighbors to spawn", nodes_to_init.len());
+        drop(sm);
+
+        // Submit NodeInitializationStarted events for all neighbors to init
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        for coord in &nodes_to_init {
+            let event = GameEvent::NodeInitializationStarted {
+                node_coord: *coord,
+                owner_id: 0,  // Neutral/unowned
+                timestamp,
+            };
+            let request = GameEventRequest { event };
+
+            // Submit event (fire and forget, errors logged)
+            if let Err(e) = state.raft.client_write(request).await {
+                eprintln!("[Lazy Init] Failed to submit initialization event for {:?}: {}", coord, e);
+            } else {
+                println!("[Lazy Init] Submitted initialization event for {:?}", coord);
+            }
+        }
+
+        // Call master API to spawn EC2 instances (async, don't wait)
+        let master_url = state.master_url.clone();
+        let game_id = state.game_id.clone();
+        tokio::spawn(async move {
+            for coord in nodes_to_init {
+                println!("[Lazy Init] Spawning EC2 instance for {:?}...", coord);
+                if let Err(e) = spawn_node_on_master(&master_url, &game_id, coord.q, coord.r, false).await {
+                    eprintln!("[Lazy Init] Failed to spawn node {:?}: {}", coord, e);
+                } else {
+                    println!("[Lazy Init] Successfully triggered spawn for {:?}", coord);
+                }
+            }
+        });
+    } else {
+        drop(sm);
+    }
 
     // Create SetNodeTarget event
     let timestamp = std::time::SystemTime::now()
@@ -347,7 +397,7 @@ async fn handle_attack_command(
 
     let event = GameEvent::SetNodeTarget {
         node_coord: req.node_coord,
-        target_coord: Some(req.target_coord),
+        target: Some(AttackTarget::Coordinate(req.target_coord)),
         timestamp,
     };
 
@@ -393,7 +443,7 @@ async fn handle_stop_attack(
 
     let event = GameEvent::SetNodeTarget {
         node_coord: req.node_coord,
-        target_coord: None,
+        target: None,
         timestamp,
     };
 
@@ -486,7 +536,7 @@ async fn handle_attack_websocket_axum(socket: axum::extract::ws::WebSocket) {
     let flood_data = vec![0u8; 1024]; // 1KB per message
 
     loop {
-        // Send data as fast as possible
+        // Send data as fast as possible - true flooding
         match sender.send(Message::Binary(flood_data.clone())).await {
             Ok(_) => {
                 // Data sent successfully, continue flooding
@@ -495,12 +545,47 @@ async fn handle_attack_websocket_axum(socket: axum::extract::ws::WebSocket) {
                 break;
             }
         }
-
-        // Small delay to avoid completely saturating the connection
-        tokio::time::sleep(std::time::Duration::from_micros(100)).await;
     }
 
     println!("[Network] Attack WebSocket connection closed");
+}
+
+/// Helper function to spawn a node on master
+async fn spawn_node_on_master(
+    master_url: &str,
+    game_id: &str,
+    q: i32,
+    r: i32,
+    is_capital: bool,
+) -> Result<()> {
+    #[derive(Serialize)]
+    struct SpawnSingleNodeRequest {
+        game_id: String,
+        is_capital: bool,
+        q: i32,
+        r: i32,
+    }
+
+    let client = reqwest::Client::new();
+    let url = format!("{}/spawn_single_node", master_url);
+    let body = SpawnSingleNodeRequest {
+        game_id: game_id.to_string(),
+        is_capital,
+        q,
+        r,
+    };
+
+    let response = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await?;
+
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        anyhow::bail!("Master returned error: {}", response.status())
+    }
 }
 
 /// Start the HTTP API server
@@ -508,8 +593,10 @@ pub async fn start_api_server(
     raft: Arc<Raft<GameRaftTypeConfig>>,
     storage: Arc<tokio::sync::RwLock<crate::raft::storage::MemStorage>>,
     addr: String,
+    master_url: String,
+    game_id: String,
 ) -> Result<()> {
-    let state = ApiState { raft, storage };
+    let state = ApiState { raft, storage, master_url, game_id };
     let app = create_router(state);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;

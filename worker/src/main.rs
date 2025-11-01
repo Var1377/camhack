@@ -4,10 +4,11 @@ mod raft;
 mod registry;
 
 use anyhow::Result;
-use game::{GameConfig, GameLogic, NetworkManager};
+use game::{FinalKillManager, GameConfig, GameLogic, NetworkManager};
 use raft::storage::GameEventRequest;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::RwLock;
 use tokio::time::sleep;
 
 #[tokio::main]
@@ -36,7 +37,7 @@ async fn main() -> Result<()> {
 
     // Step 5: Register with master and get peer
     println!("\n[4/6] Registering with master...");
-    let peer = registry::register_and_get_peer(worker_id.clone(), task_arn, my_ip.clone(), game_id).await?;
+    let peer = registry::register_and_get_peer(worker_id.clone(), task_arn, my_ip.clone(), game_id.clone()).await?;
 
     // Step 6: Initialize Raft node
     println!("\n[5/6] Initializing Raft node...");
@@ -58,8 +59,11 @@ async fn main() -> Result<()> {
     let api_raft = raft_node.raft.clone();
     let api_storage = raft_node.storage.clone();
     let api_addr = format!("0.0.0.0:8080");
+    let master_url = std::env::var("MASTER_URL")
+        .unwrap_or_else(|_| "http://localhost:8080".to_string());
+    let api_game_id = game_id.clone();
     tokio::spawn(async move {
-        if let Err(e) = raft::api::start_api_server(api_raft, api_storage, api_addr).await {
+        if let Err(e) = raft::api::start_api_server(api_raft, api_storage, api_addr, master_url, api_game_id).await {
             eprintln!("HTTP API server error: {}", e);
         }
     });
@@ -77,8 +81,11 @@ async fn main() -> Result<()> {
     // Initialize game logic (used when this node is leader)
     let mut game_logic = GameLogic::new(GameConfig::default());
 
-    // Initialize network manager (for WebSocket attack connections and metrics)
-    let network_manager = Arc::new(NetworkManager::new());
+    // Initialize network manager (for UDP attack connections and metrics)
+    let network_manager = Arc::new(RwLock::new(NetworkManager::new()));
+
+    // Initialize final kill manager (for 10-second client kill attacks)
+    let final_kill_manager = Arc::new(FinalKillManager::new());
 
     // TODO: Auto-join the game or wait for manual join via API
     // For now, NetworkManager will be initialized with node coord/capacity when the first
@@ -87,6 +94,7 @@ async fn main() -> Result<()> {
     // Main loop - run game logic tick and show status
     let mut tick_count = 0;
     let mut metrics_tick = 0;
+    let mut final_kills_started = std::collections::HashSet::new();
 
     loop {
         sleep(Duration::from_secs(1)).await;
@@ -103,13 +111,94 @@ async fn main() -> Result<()> {
         let game_state = sm.game_state.clone();
         drop(sm);
 
+        // Check for players who lost their capital and trigger final kill on their client
+        for (player_id, player) in &game_state.players {
+            if !player.alive && !final_kills_started.contains(player_id) {
+                // Player lost their capital, trigger final kill on their client
+                if let Some(client_ip) = game_state.client_ips.get(player_id) {
+                    // Find who captured their capital (the new owner)
+                    if let Some(capital_node) = game_state.nodes.get(&player.capital_coord) {
+                        let attacker_id = capital_node.owner_id;
+
+                        // Get all nodes owned by the attacker
+                        let attacker_nodes: Vec<_> = game_state.nodes.values()
+                            .filter(|n| n.owner_id == attacker_id)
+                            .map(|n| n.coord)
+                            .collect();
+
+                        if !attacker_nodes.is_empty() {
+                            println!("[Main] Player {} lost capital, triggering final kill from {} nodes",
+                                player_id, attacker_nodes.len());
+
+                            let fkm = final_kill_manager.clone();
+                            let client_ip_clone = client_ip.clone();
+                            let pid = *player_id;
+                            tokio::spawn(async move {
+                                if let Err(e) = fkm.start_final_kill(pid, client_ip_clone, attacker_nodes).await {
+                                    eprintln!("[Main] Failed to start final kill on player {}: {}", pid, e);
+                                }
+                            });
+
+                            final_kills_started.insert(*player_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check if game is over (only leader initiates shutdown)
+        if game_state.game_over && is_leader {
+            println!("\n=== GAME OVER ===");
+            println!("Only one player remains!");
+            println!("Shutting down all infrastructure...");
+
+            // Get master URL from environment
+            let master_url = std::env::var("MASTER_URL")
+                .unwrap_or_else(|_| "http://localhost:8080".to_string());
+
+            // Call master to kill all workers
+            println!("Calling master to shutdown all workers...");
+            let client = reqwest::Client::new();
+            match client.post(format!("{}/kill_workers", master_url)).send().await {
+                Ok(response) => {
+                    if response.status().is_success() {
+                        println!("✓ All workers shutdown initiated");
+                    } else {
+                        eprintln!("✗ Failed to shutdown workers: {}", response.status());
+                    }
+                }
+                Err(e) => {
+                    eprintln!("✗ Error calling master: {}", e);
+                }
+            }
+
+            // Call master to kill itself
+            println!("Calling master to shutdown...");
+            match client.post(format!("{}/kill", master_url)).send().await {
+                Ok(response) => {
+                    if response.status().is_success() {
+                        println!("✓ Master shutdown initiated");
+                    } else {
+                        eprintln!("✗ Failed to shutdown master: {}", response.status());
+                    }
+                }
+                Err(e) => {
+                    eprintln!("✗ Error calling master: {}", e);
+                }
+            }
+
+            println!("Game infrastructure shutdown complete!");
+            println!("Exiting worker...");
+            std::process::exit(0);
+        }
+
         // Sync network manager with game state (start/stop attacks)
-        network_manager.sync_with_game_state(&game_state, &game_state.node_ips).await;
+        network_manager.write().await.sync_with_game_state(&game_state, &game_state.node_ips, &my_ip).await;
 
         // Every 5 seconds, submit metrics reports
         if metrics_tick >= 5 {
             metrics_tick = 0;
-            let metrics_events = network_manager.get_metrics().await;
+            let metrics_events = network_manager.read().await.get_metrics().await;
 
             for event in metrics_events {
                 let request = GameEventRequest { event: event.clone() };

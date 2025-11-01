@@ -1,28 +1,31 @@
 use super::events::{GameEvent, NodeCoord};
 use super::state::GameState;
+use super::udp::{udp_responder, udp_attacker, PacketLossTracker};
 use anyhow::Result;
-use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::RwLock;
-use tokio::time::sleep;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio::net::UdpSocket;
+use tokio::sync::{broadcast, RwLock};
 
-/// Manages WebSocket attack connections and metrics
+/// Manages hybrid UDP/WebSocket attack connections and metrics
+/// Capacity determined by actual network infrastructure
 pub struct NetworkManager {
     my_coord: Option<NodeCoord>,
-    my_capacity: u64, // bytes/sec
     /// Active attack connections (target_coord -> connection handle)
     active_attacks: Arc<RwLock<HashMap<NodeCoord, AttackConnection>>>,
-    /// Total bytes received from all attacks
+    /// Packet loss trackers for each active UDP attack
+    packet_trackers: Arc<RwLock<HashMap<NodeCoord, PacketLossTracker>>>,
+    /// Total bytes received from all attacks (UDP + WebSocket)
     bytes_received: Arc<AtomicU64>,
     /// Last measurement time for bandwidth calculation
     last_measurement: Arc<RwLock<SystemTime>>,
+    /// UDP socket for sending attack packets to workers
+    udp_socket: Option<Arc<UdpSocket>>,
 }
 
-/// Represents an active WebSocket attack connection to a target node
+/// Represents an active UDP attack connection to a grid node
 struct AttackConnection {
     target_coord: NodeCoord,
     target_ip: String,
@@ -32,77 +35,51 @@ struct AttackConnection {
 
 impl NetworkManager {
     pub fn new() -> Self {
+        // Start UDP responder to receive incoming attack packets
+        // This runs independently and doesn't need to know our coordinate
+        let bytes_received = Arc::new(AtomicU64::new(0));
+        let bytes_received_clone = bytes_received.clone();
+
+        tokio::spawn(async move {
+            if let Err(e) = udp_responder(bytes_received_clone).await {
+                eprintln!("[Network] UDP responder error: {}", e);
+            }
+        });
+
         Self {
             my_coord: None,
-            my_capacity: 0,
             active_attacks: Arc::new(RwLock::new(HashMap::new())),
-            bytes_received: Arc::new(AtomicU64::new(0)),
+            packet_trackers: Arc::new(RwLock::new(HashMap::new())),
+            bytes_received,
             last_measurement: Arc::new(RwLock::new(SystemTime::now())),
+            udp_socket: None,
         }
     }
 
-    /// Initialize with this node's info
-    pub fn initialize(&mut self, my_coord: NodeCoord, my_capacity: u64) {
-        self.my_coord = Some(my_coord);
-        self.my_capacity = my_capacity;
-        println!("[Network] Initialized: coord={:?}, capacity={} bytes/s", my_coord, my_capacity);
-    }
-
-    /// Start an attack by opening WebSocket connection to target node
-    async fn start_attack_connection(
+    /// Start a UDP attack on a target node
+    async fn start_udp_attack(
         &self,
         target_coord: NodeCoord,
         target_ip: String,
     ) -> Result<()> {
-        let (stop_tx, mut stop_rx) = tokio::sync::broadcast::channel(1);
-        let bytes_received = self.bytes_received.clone();
+        let (stop_tx, stop_rx) = broadcast::channel(1);
+
+        // Create packet loss tracker for this attack
+        let tracker = PacketLossTracker::new();
+
+        // Store tracker
+        let mut trackers = self.packet_trackers.write().await;
+        trackers.insert(target_coord, tracker.clone());
+        drop(trackers);
+
         let target_ip_for_spawn = target_ip.clone();
 
-        // Spawn task to maintain WebSocket connection
+        // Spawn UDP attacker task
         tokio::spawn(async move {
-            let ws_url = format!("ws://{}:8080/attack", target_ip_for_spawn);
-            println!("[Network] Opening attack WS to {:?} at {}", target_coord, ws_url);
+            println!("[Network] Starting UDP attack on {:?} at {}", target_coord, target_ip_for_spawn);
 
-            // Try to connect
-            match connect_async(&ws_url).await {
-                Ok((mut ws_stream, _)) => {
-                    println!("[Network] Connected to {:?}", target_coord);
-
-                    // Receive data from target until stopped
-                    loop {
-                        tokio::select! {
-                            // Check for stop signal
-                            _ = stop_rx.recv() => {
-                                println!("[Network] Stopping attack on {:?}", target_coord);
-                                let _ = ws_stream.close(None).await;
-                                break;
-                            }
-                            // Receive data from WebSocket
-                            msg = ws_stream.next() => {
-                                match msg {
-                                    Some(Ok(Message::Binary(data))) => {
-                                        // Count bytes received
-                                        bytes_received.fetch_add(data.len() as u64, Ordering::Relaxed);
-                                    }
-                                    Some(Ok(_)) => {
-                                        // Ignore other message types
-                                    }
-                                    Some(Err(e)) => {
-                                        eprintln!("[Network] WebSocket error from {:?}: {}", target_coord, e);
-                                        break;
-                                    }
-                                    None => {
-                                        println!("[Network] WebSocket closed by {:?}", target_coord);
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("[Network] Failed to connect to {:?}: {}", target_coord, e);
-                }
+            if let Err(e) = udp_attacker(target_ip_for_spawn, tracker, stop_rx).await {
+                eprintln!("[Network] UDP attacker error on {:?}: {}", target_coord, e);
             }
         });
 
@@ -127,6 +104,10 @@ impl NetworkManager {
             let _ = connection.stop_signal.send(());
             println!("[Network] Stopped attack on {:?}", target_coord);
         }
+
+        // Clean up packet tracker
+        let mut trackers = self.packet_trackers.write().await;
+        trackers.remove(&target_coord);
     }
 
     /// Get current metrics for all active attacks
@@ -150,11 +131,13 @@ impl NetworkManager {
         let bytes = self.bytes_received.swap(0, Ordering::Relaxed);
         let bandwidth_in = (bytes as f64 / duration.as_secs_f64()) as u64;
 
-        // Calculate packet loss based on capacity
-        let packet_loss = if bandwidth_in > self.my_capacity {
-            ((bandwidth_in - self.my_capacity) as f32) / (bandwidth_in as f32)
-        } else {
+        // Calculate average packet loss across all active attacks
+        let trackers = self.packet_trackers.read().await;
+        let packet_loss = if trackers.is_empty() {
             0.0
+        } else {
+            let total_loss: f32 = trackers.values().map(|t| t.calculate_loss()).sum();
+            total_loss / trackers.len() as f32
         };
 
         let timestamp = SystemTime::now()
@@ -174,20 +157,40 @@ impl NetworkManager {
     /// Update attacks based on current game state
     /// This is called when this node is BEING ATTACKED
     pub async fn sync_with_game_state(
-        &self,
+        &mut self,
         game_state: &GameState,
         ip_map: &HashMap<NodeCoord, String>,
+        my_ip: &str,
     ) {
+        // Auto-discover my coordinate if not yet known
         let my_coord = match self.my_coord {
             Some(c) => c,
-            None => return,
+            None => {
+                // Find my coordinate by matching my IP in the IP map
+                let found_coord = ip_map
+                    .iter()
+                    .find(|(_, ip)| ip.as_str() == my_ip)
+                    .map(|(coord, _)| *coord);
+
+                match found_coord {
+                    Some(coord) => {
+                        println!("[Network] Auto-discovered my coordinate: {:?}", coord);
+                        self.my_coord = Some(coord);
+                        coord
+                    }
+                    None => {
+                        // My IP not in map yet - still initializing
+                        return;
+                    }
+                }
+            }
         };
 
         // Find all nodes that are attacking ME
         let attackers: Vec<(NodeCoord, u64)> = game_state
             .nodes
             .values()
-            .filter(|node| node.current_target == Some(my_coord))
+            .filter(|node| node.current_target == Some(super::events::AttackTarget::Coordinate(my_coord)))
             .map(|node| (node.coord, node.owner_id))
             .collect();
 
@@ -203,51 +206,40 @@ impl NetworkManager {
             return;
         }
 
-        // For each attacker, open connections to ALL nodes owned by that player
-        for (_attacker_coord, attacker_owner) in &attackers {
-            let attacker_nodes = game_state
-                .nodes
-                .values()
-                .filter(|n| n.owner_id == *attacker_owner);
+        // For each attacking coordinate, open a 1-to-1 UDP connection
+        for (attacker_coord, _attacker_owner) in &attackers {
+            // Check if we already have a connection to this attacker
+            let attacks = self.active_attacks.read().await;
+            if attacks.contains_key(attacker_coord) {
+                continue;
+            }
+            drop(attacks);
 
-            for node in attacker_nodes {
-                // Check if we already have a connection to this node
-                let attacks = self.active_attacks.read().await;
-                if attacks.contains_key(&node.coord) {
-                    continue;
+            // Get IP for the attacking node (1-to-1 connection)
+            if let Some(target_ip) = ip_map.get(attacker_coord) {
+                // Open UDP attack to THIS SPECIFIC attacking node only
+                if let Err(e) = self
+                    .start_udp_attack(*attacker_coord, target_ip.clone())
+                    .await
+                {
+                    eprintln!("[Network] Failed to start UDP attack: {}", e);
                 }
-                drop(attacks);
-
-                // Get IP for this node
-                if let Some(target_ip) = ip_map.get(&node.coord) {
-                    // Open WebSocket connection to this node
-                    if let Err(e) = self
-                        .start_attack_connection(node.coord, target_ip.clone())
-                        .await
-                    {
-                        eprintln!("[Network] Failed to start attack connection: {}", e);
-                    }
-                }
+            } else {
+                // Attacking node has no IP yet - skip for now
+                println!("[Network] Attacker {:?} has no IP yet, skipping", attacker_coord);
             }
         }
 
-        // Stop connections to nodes that are no longer part of the attack
-        let all_attacker_nodes: Vec<NodeCoord> = attackers
+        // Stop connections to nodes that are no longer attacking
+        let attacker_coords: Vec<NodeCoord> = attackers
             .iter()
-            .flat_map(|(_, owner_id)| {
-                game_state
-                    .nodes
-                    .values()
-                    .filter(|n| n.owner_id == *owner_id)
-                    .map(|n| n.coord)
-                    .collect::<Vec<_>>()
-            })
+            .map(|(coord, _)| *coord)
             .collect();
 
         let attacks = self.active_attacks.read().await;
         let to_stop: Vec<NodeCoord> = attacks
             .keys()
-            .filter(|coord| !all_attacker_nodes.contains(coord))
+            .filter(|coord| !attacker_coords.contains(coord))
             .copied()
             .collect();
         drop(attacks);

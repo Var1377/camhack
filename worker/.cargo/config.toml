@@ -1,2 +1,2 @@
 [build]
-target = "aarch64-unknown-linux-gnu"  # ARM64 for better performance and cost
+target = "x86_64-unknown-linux-gnu"  # x86_64 for local development

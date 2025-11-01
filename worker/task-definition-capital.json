@@ -1,0 +1,56 @@
+{
+  "family": "udp-node-capital",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "arn:aws:iam::YOUR_ACCOUNT_ID:role/ecsTaskExecutionRole",
+  "containerDefinitions": [
+    {
+      "name": "udp-node-capital",
+      "image": "YOUR_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/udp-node:latest",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 5000,
+          "protocol": "tcp"
+        },
+        {
+          "containerPort": 8080,
+          "protocol": "udp"
+        },
+        {
+          "containerPort": 8081,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        {
+          "name": "MASTER_URL",
+          "value": "http://REPLACE_WITH_MASTER_IP:8080"
+        },
+        {
+          "name": "WORKER_ID",
+          "value": "capital-${TASK_ID}"
+        },
+        {
+          "name": "RAFT_PORT",
+          "value": "5000"
+        },
+        {
+          "name": "GAME_PORT",
+          "value": "8080"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/udp-nodes-capital",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "udp-node-capital",
+          "awslogs-create-group": "true"
+        }
+      }
+    }
+  ]
+}

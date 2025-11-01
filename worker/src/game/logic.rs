@@ -1,4 +1,4 @@
-use super::events::{GameEvent, NodeCoord};
+use super::events::{AttackTarget, GameEvent, NodeCoord};
 use super::state::GameState;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -14,7 +14,7 @@ pub struct GameConfig {
 impl Default for GameConfig {
     fn default() -> Self {
         Self {
-            overload_duration_secs: 10,
+            overload_duration_secs: 5,
             overload_threshold: 0.2, // 20% packet loss
         }
     }
@@ -62,11 +62,11 @@ impl GameLogic {
         for node in game_state.nodes.values() {
             let target_coord = node.coord;
 
-            // Find who's attacking this node
+            // Find who's attacking this node (only grid coordinate attacks)
             let attackers: Vec<_> = game_state
                 .nodes
                 .values()
-                .filter(|n| n.current_target == Some(target_coord))
+                .filter(|n| n.current_target == Some(AttackTarget::Coordinate(target_coord)))
                 .collect();
 
             if attackers.is_empty() {
@@ -159,8 +159,8 @@ mod tests {
                 coord: NodeCoord::new(0, 0),
                 owner_id: 1,
                 node_type: NodeType::Capital,
-                capacity: 10_000_000,
                 current_target: None,
+                is_client: false,
             },
         );
         game_state.nodes.insert(
@@ -169,8 +169,8 @@ mod tests {
                 coord: NodeCoord::new(1, 0),
                 owner_id: 2,
                 node_type: NodeType::Capital,
-                capacity: 10_000_000,
-                current_target: Some(NodeCoord::new(0, 0)), // Bob attacks Alice
+                current_target: Some(AttackTarget::Coordinate(NodeCoord::new(0, 0))), // Bob attacks Alice
+                is_client: false,
             },
         );
 

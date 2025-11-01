@@ -31,11 +31,15 @@ impl NodeRegistry {
     }
 
     /// Remove a node from the registry
+    /// Currently unused but planned for graceful shutdown implementation
+    #[allow(dead_code)]
     pub async fn unregister(&self, node_id: NodeId) -> Option<String> {
         self.nodes.write().await.remove(&node_id)
     }
 
     /// Get all registered nodes
+    /// Currently unused but planned for cluster visibility endpoints
+    #[allow(dead_code)]
     pub async fn get_all_nodes(&self) -> Vec<(NodeId, String)> {
         self.nodes
             .read()
@@ -45,19 +49,11 @@ impl NodeRegistry {
             .collect()
     }
 
-    /// Check if a node is registered
-    pub async fn contains(&self, node_id: NodeId) -> bool {
-        self.nodes.read().await.contains_key(&node_id)
-    }
-
     /// Get the number of registered nodes
+    /// Currently unused but planned for monitoring/status endpoints
+    #[allow(dead_code)]
     pub async fn len(&self) -> usize {
         self.nodes.read().await.len()
-    }
-
-    /// Check if the registry is empty
-    pub async fn is_empty(&self) -> bool {
-        self.nodes.read().await.is_empty()
     }
 }
 
@@ -88,11 +84,11 @@ mod tests {
         let registry = NodeRegistry::new();
 
         registry.register(1, "10.0.1.5:5000".to_string()).await;
-        assert!(registry.contains(1).await);
+        assert!(registry.get_address(1).await.is_some());
 
         let removed = registry.unregister(1).await;
         assert_eq!(removed, Some("10.0.1.5:5000".to_string()));
-        assert!(!registry.contains(1).await);
+        assert!(registry.get_address(1).await.is_none());
     }
 
     #[tokio::test]
@@ -111,14 +107,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_len_and_is_empty() {
+    async fn test_len() {
         let registry = NodeRegistry::new();
 
-        assert!(registry.is_empty().await);
         assert_eq!(registry.len().await, 0);
 
         registry.register(1, "10.0.1.5:5000".to_string()).await;
-        assert!(!registry.is_empty().await);
         assert_eq!(registry.len().await, 1);
 
         registry.register(2, "10.0.1.6:5000".to_string()).await;

@@ -76,21 +76,6 @@ impl RaftNode {
         let metrics = self.raft.metrics().borrow().clone();
         metrics.current_leader
     }
-
-    /// Get current term
-    pub async fn get_term(&self) -> u64 {
-        let metrics = self.raft.metrics().borrow().clone();
-        metrics.current_term
-    }
-
-    /// Get Raft metrics for debugging
-    pub async fn get_metrics(&self) -> String {
-        let metrics = self.raft.metrics().borrow().clone();
-        format!(
-            "Node {}: term={}, leader={:?}, state={:?}",
-            self.node_id, metrics.current_term, metrics.current_leader, metrics.state
-        )
-    }
 }
 
 /// Bootstrap a new Raft cluster (first worker)
