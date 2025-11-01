@@ -1,0 +1,4 @@
+FROM debian:bookworm-slim
+COPY target/release/master /usr/local/bin/master-node
+EXPOSE 8080/tcp
+CMD ["master-node"]

@@ -1,0 +1,64 @@
+syntax = "proto3";
+
+package raft;
+
+// Raft RPC service for inter-worker communication
+service RaftService {
+    // AppendEntries RPC - replicate log entries and send heartbeats
+    rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+
+    // RequestVote RPC - candidate requests votes from other nodes
+    rpc RequestVote(VoteRequest) returns (VoteResponse);
+
+    // InstallSnapshot RPC - leader sends snapshot to slow follower
+    rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotResponse);
+}
+
+// AppendEntries RPC messages
+message AppendEntriesRequest {
+    uint64 term = 1;
+    uint64 leader_id = 2;
+    uint64 prev_log_index = 3;
+    uint64 prev_log_term = 4;
+    repeated LogEntry entries = 5;
+    uint64 leader_commit = 6;
+}
+
+message AppendEntriesResponse {
+    uint64 term = 1;
+    bool success = 2;
+}
+
+// RequestVote RPC messages
+message VoteRequest {
+    uint64 term = 1;
+    uint64 candidate_id = 2;
+    uint64 last_log_index = 3;
+    uint64 last_log_term = 4;
+}
+
+message VoteResponse {
+    uint64 term = 1;
+    bool vote_granted = 2;
+}
+
+// InstallSnapshot RPC messages
+message InstallSnapshotRequest {
+    uint64 term = 1;
+    uint64 leader_id = 2;
+    uint64 last_included_index = 3;
+    uint64 last_included_term = 4;
+    bytes data = 5;
+    bool done = 6;
+}
+
+message InstallSnapshotResponse {
+    uint64 term = 1;
+}
+
+// Log entry
+message LogEntry {
+    uint64 index = 1;
+    uint64 term = 2;
+    bytes data = 3;
+}

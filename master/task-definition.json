@@ -1,0 +1,53 @@
+{
+  "family": "master-node",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "executionRoleArn": "arn:aws:iam::YOUR_ACCOUNT_ID:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::YOUR_ACCOUNT_ID:role/ecsMasterTaskRole",
+  "containerDefinitions": [
+    {
+      "name": "master-node",
+      "image": "YOUR_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/master-node:latest",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 8080,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        {
+          "name": "PORT",
+          "value": "8080"
+        },
+        {
+          "name": "CLUSTER_NAME",
+          "value": "udp-test-cluster"
+        },
+        {
+          "name": "WORKER_TASK_DEFINITION",
+          "value": "udp-node"
+        },
+        {
+          "name": "SUBNET_ID",
+          "value": "WILL_BE_SET_BY_DEPLOY_SCRIPT"
+        },
+        {
+          "name": "SECURITY_GROUP_ID",
+          "value": "WILL_BE_SET_BY_DEPLOY_SCRIPT"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/master-node",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "master",
+          "awslogs-create-group": "true"
+        }
+      }
+    }
+  ]
+}

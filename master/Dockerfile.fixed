@@ -1,0 +1,6 @@
+FROM rust:slim as certs
+FROM debian:bookworm-slim
+COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY target/release/master /usr/local/bin/master-node
+EXPOSE 8080/tcp
+CMD ["master-node"]
