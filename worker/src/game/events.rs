@@ -1,95 +1,50 @@
 use serde::{Deserialize, Serialize};
 
-/// Game event types - classified by whether they require consensus
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum GameEvent {
-    /// Critical events that go through Raft consensus
-    Critical(CriticalEvent),
-    /// Ephemeral events that are leader-only (no consensus)
-    Ephemeral(EphemeralEvent),
+/// Axial coordinates for triangular grid
+/// Each node has 6 neighbors at: (q±1, r), (q, r±1), (q±1, r∓1)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct NodeCoord {
+    pub q: i32,
+    pub r: i32,
 }
 
-/// Critical events that require strong consistency via Raft
+/// Type of node on the grid
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NodeType {
+    /// Player's capital - starts on grid, larger capacity
+    Capital,
+    /// Regular captured node
+    Regular,
+}
+
+/// Game events - all go through Raft consensus for CamHack
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum CriticalEvent {
-    /// Player joins the game
+pub enum GameEvent {
+    /// Player joins the game with local node + capital on grid
     PlayerJoin {
         player_id: u64,
         name: String,
+        capital_coord: NodeCoord,
+        node_ip: String,  // IP address of the worker/node
         timestamp: u64,
     },
-    /// Player leaves the game
-    PlayerLeave {
-        player_id: u64,
+    /// Node switches its attack target (or None to stop attacking)
+    SetNodeTarget {
+        node_coord: NodeCoord,
+        target_coord: Option<NodeCoord>,
         timestamp: u64,
     },
-    /// Score update
-    ScoreUpdate {
-        player_id: u64,
-        score: i32,
+    /// Node is captured after sustained overload
+    NodeCaptured {
+        node_coord: NodeCoord,
+        new_owner_id: u64,
         timestamp: u64,
     },
-    /// Inventory change
-    InventoryChange {
-        player_id: u64,
-        item_id: u64,
-        quantity: i32,
+    /// Node reports its metrics (bandwidth, packet loss)
+    NodeMetricsReport {
+        node_coord: NodeCoord,
+        bandwidth_in: u64,  // bytes/sec
+        packet_loss: f32,   // 0.0 to 1.0
         timestamp: u64,
     },
-    /// Game state checkpoint
-    StateCheckpoint {
-        checkpoint_id: u64,
-        data: Vec<u8>,
-        timestamp: u64,
-    },
-}
-
-/// Ephemeral events that don't require consensus (leader-only)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum EphemeralEvent {
-    /// Player movement
-    PlayerMove {
-        player_id: u64,
-        x: f32,
-        y: f32,
-        z: f32,
-        timestamp: u64,
-    },
-    /// Player rotation
-    PlayerRotate {
-        player_id: u64,
-        yaw: f32,
-        pitch: f32,
-        timestamp: u64,
-    },
-    /// Projectile spawned
-    ProjectileSpawn {
-        projectile_id: u64,
-        x: f32,
-        y: f32,
-        z: f32,
-        velocity_x: f32,
-        velocity_y: f32,
-        velocity_z: f32,
-        timestamp: u64,
-    },
-    /// Animation state change
-    AnimationState {
-        entity_id: u64,
-        animation: String,
-        timestamp: u64,
-    },
-    /// Chat message
-    ChatMessage {
-        player_id: u64,
-        message: String,
-        timestamp: u64,
-    },
-}
-
-impl GameEvent {
-    /// Check if this event requires Raft consensus
-    pub fn requires_consensus(&self) -> bool {
-        matches!(self, GameEvent::Critical(_))
-    }
 }

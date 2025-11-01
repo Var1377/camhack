@@ -1,13 +1,13 @@
-use crate::game::GameEvent;
-use anyhow::Result;
+use crate::game::{GameEvent, GameState};
 use openraft::storage::{LogState, Snapshot};
 use openraft::{
-    Entry, EntryPayload, LogId, RaftLogReader, RaftSnapshotBuilder, RaftStorage, SnapshotMeta,
-    StorageError, StorageIOError, Vote,
+    Entry, EntryPayload, ErrorSubject, ErrorVerb, LogId, RaftLogReader, RaftSnapshotBuilder,
+    RaftStorage, SnapshotMeta, StorageError, StoredMembership, Vote,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt::Debug;
+use std::io::Cursor;
 use std::ops::RangeBounds;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -30,13 +30,19 @@ pub struct GameEventResponse {
 /// Snapshot data type
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GameStateSnapshot {
-    pub events: Vec<GameEvent>,
+    pub events: Vec<GameEvent>,  // For replay/audit
     pub last_applied_log_index: u64,
 }
 
 /// Type config for OpenRaft
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct GameRaftTypeConfig;
+
+impl std::fmt::Display for GameRaftTypeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "GameRaftTypeConfig")
+    }
+}
 
 impl openraft::RaftTypeConfig for GameRaftTypeConfig {
     type D = GameEventRequest;
@@ -44,8 +50,9 @@ impl openraft::RaftTypeConfig for GameRaftTypeConfig {
     type NodeId = NodeId;
     type Node = ();
     type Entry = Entry<Self>;
-    type SnapshotData = GameStateSnapshot;
+    type SnapshotData = Cursor<Vec<u8>>;
     type AsyncRuntime = openraft::TokioRuntime;
+    type Responder = openraft::impls::OneshotResponder<Self>;
 }
 
 /// In-memory storage for Raft
@@ -64,11 +71,17 @@ pub struct MemStorage {
 
     /// Snapshot metadata
     snapshot_meta: Arc<RwLock<Option<SnapshotMeta<NodeId, ()>>>>,
+
+    /// Committed membership
+    committed: Arc<RwLock<Option<StoredMembership<NodeId, ()>>>>,
 }
 
-/// Game state machine that stores all events
+/// Game state machine - derived state + event history
 pub struct GameStateMachine {
-    /// All game events in order
+    /// Derived game state (players, nodes, attacks, etc.)
+    pub game_state: GameState,
+
+    /// All game events in order (for replay/audit)
     pub events: Vec<GameEvent>,
 
     /// Last applied log index
@@ -81,11 +94,13 @@ impl MemStorage {
             vote: Arc::new(RwLock::new(None)),
             log: Arc::new(RwLock::new(BTreeMap::new())),
             state_machine: Arc::new(RwLock::new(GameStateMachine {
+                game_state: GameState::new(),
                 events: Vec::new(),
                 last_applied_log_index: 0,
             })),
             snapshot: Arc::new(RwLock::new(None)),
             snapshot_meta: Arc::new(RwLock::new(None)),
+            committed: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -93,11 +108,21 @@ impl MemStorage {
     pub fn state_machine(&self) -> Arc<RwLock<GameStateMachine>> {
         self.state_machine.clone()
     }
+
+    pub fn clone_storage(&self) -> Self {
+        Self {
+            vote: self.vote.clone(),
+            log: self.log.clone(),
+            state_machine: self.state_machine.clone(),
+            snapshot: self.snapshot.clone(),
+            snapshot_meta: self.snapshot_meta.clone(),
+            committed: self.committed.clone(),
+        }
+    }
 }
 
-#[async_trait::async_trait]
 impl RaftLogReader<GameRaftTypeConfig> for MemStorage {
-    async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug + Send + Sync>(
+    async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug + Send>(
         &mut self,
         range: RB,
     ) -> Result<Vec<Entry<GameRaftTypeConfig>>, StorageError<NodeId>> {
@@ -110,7 +135,6 @@ impl RaftLogReader<GameRaftTypeConfig> for MemStorage {
     }
 }
 
-#[async_trait::async_trait]
 impl RaftSnapshotBuilder<GameRaftTypeConfig> for MemStorage {
     async fn build_snapshot(&mut self) -> Result<Snapshot<GameRaftTypeConfig>, StorageError<NodeId>> {
         let sm = self.state_machine.read().await;
@@ -119,23 +143,39 @@ impl RaftSnapshotBuilder<GameRaftTypeConfig> for MemStorage {
             last_applied_log_index: sm.last_applied_log_index,
         };
 
+        // Serialize snapshot to bytes
+        let bytes = bincode::serialize(&snapshot_data)
+            .map_err(|e| {
+                StorageError::from_io_error(
+                    ErrorSubject::Snapshot(None),
+                    ErrorVerb::Read,
+                    std::io::Error::new(std::io::ErrorKind::Other, e)
+                )
+            })?;
+
         let meta = SnapshotMeta {
-            last_log_id: LogId::new(0, sm.last_applied_log_index),
-            last_membership: Default::default(),
+            last_log_id: if sm.last_applied_log_index > 0 {
+                Some(LogId::new(
+                    openraft::LeaderId::new(0, 0),
+                    sm.last_applied_log_index
+                ))
+            } else {
+                None
+            },
+            last_membership: self.committed.read().await.clone().unwrap_or_default(),
             snapshot_id: format!("snapshot-{}", sm.last_applied_log_index),
         };
 
-        *self.snapshot.write().await = Some(snapshot_data.clone());
+        *self.snapshot.write().await = Some(snapshot_data);
         *self.snapshot_meta.write().await = Some(meta.clone());
 
         Ok(Snapshot {
             meta,
-            snapshot: Box::new(snapshot_data),
+            snapshot: Box::new(Cursor::new(bytes)),
         })
     }
 }
 
-#[async_trait::async_trait]
 impl RaftStorage<GameRaftTypeConfig> for MemStorage {
     type LogReader = Self;
     type SnapshotBuilder = Self;
@@ -195,23 +235,20 @@ impl RaftStorage<GameRaftTypeConfig> for MemStorage {
 
     async fn last_applied_state(
         &mut self,
-    ) -> Result<(Option<LogId<NodeId>>, SnapshotMeta<NodeId, ()>), StorageError<NodeId>> {
+    ) -> Result<(Option<LogId<NodeId>>, StoredMembership<NodeId, ()>), StorageError<NodeId>> {
         let sm = self.state_machine.read().await;
         let last_log_id = if sm.last_applied_log_index > 0 {
-            Some(LogId::new(0, sm.last_applied_log_index))
+            Some(LogId::new(
+                openraft::LeaderId::new(0, 0),
+                sm.last_applied_log_index
+            ))
         } else {
             None
         };
 
-        let snapshot_meta = self.snapshot_meta.read().await.clone().unwrap_or_else(|| {
-            SnapshotMeta {
-                last_log_id: None,
-                last_membership: Default::default(),
-                snapshot_id: "empty".to_string(),
-            }
-        });
+        let committed = self.committed.read().await.clone().unwrap_or_default();
 
-        Ok((last_log_id, snapshot_meta))
+        Ok((last_log_id, committed))
     }
 
     async fn apply_to_state_machine(
@@ -223,7 +260,12 @@ impl RaftStorage<GameRaftTypeConfig> for MemStorage {
 
         for entry in entries {
             if let EntryPayload::Normal(request) = &entry.payload {
+                // Store event for replay/audit
                 sm.events.push(request.event.clone());
+
+                // Process event into derived game state
+                sm.game_state.process_event(request.event.clone(), entry.log_id.index);
+
                 sm.last_applied_log_index = entry.log_id.index;
                 responses.push(GameEventResponse { success: true });
             } else {
@@ -238,24 +280,39 @@ impl RaftStorage<GameRaftTypeConfig> for MemStorage {
         self.clone_storage()
     }
 
-    async fn begin_receiving_snapshot(&mut self) -> Result<Box<GameStateSnapshot>, StorageError<NodeId>> {
-        Ok(Box::new(GameStateSnapshot {
-            events: Vec::new(),
-            last_applied_log_index: 0,
-        }))
+    async fn begin_receiving_snapshot(&mut self) -> Result<Box<Cursor<Vec<u8>>>, StorageError<NodeId>> {
+        Ok(Box::new(Cursor::new(Vec::new())))
     }
 
     async fn install_snapshot(
         &mut self,
         meta: &SnapshotMeta<NodeId, ()>,
-        snapshot: Box<GameStateSnapshot>,
+        snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<NodeId>> {
-        let mut sm = self.state_machine.write().await;
-        sm.events = snapshot.events.clone();
-        sm.last_applied_log_index = snapshot.last_applied_log_index;
+        // Deserialize snapshot from bytes
+        let bytes = snapshot.get_ref();
+        let snapshot_data: GameStateSnapshot = bincode::deserialize(bytes)
+            .map_err(|e| {
+                StorageError::from_io_error(
+                    ErrorSubject::Snapshot(Some(meta.signature())),
+                    ErrorVerb::Read,
+                    std::io::Error::new(std::io::ErrorKind::Other, e)
+                )
+            })?;
 
-        *self.snapshot.write().await = Some(*snapshot);
+        let mut sm = self.state_machine.write().await;
+        sm.events = snapshot_data.events.clone();
+        sm.last_applied_log_index = snapshot_data.last_applied_log_index;
+
+        // Rebuild game state from events
+        sm.game_state = GameState::new();
+        for (idx, event) in snapshot_data.events.iter().enumerate() {
+            sm.game_state.process_event(event.clone(), idx as u64 + 1);
+        }
+
+        *self.snapshot.write().await = Some(snapshot_data);
         *self.snapshot_meta.write().await = Some(meta.clone());
+        *self.committed.write().await = Some(meta.last_membership.clone());
 
         Ok(())
     }
@@ -265,23 +322,23 @@ impl RaftStorage<GameRaftTypeConfig> for MemStorage {
         let meta = self.snapshot_meta.read().await.clone();
 
         match (snapshot, meta) {
-            (Some(data), Some(meta)) => Ok(Some(Snapshot {
-                meta,
-                snapshot: Box::new(data),
-            })),
-            _ => Ok(None),
-        }
-    }
-}
+            (Some(data), Some(meta)) => {
+                // Serialize snapshot to bytes
+                let bytes = bincode::serialize(&data)
+                    .map_err(|e| {
+                        StorageError::from_io_error(
+                            ErrorSubject::Snapshot(Some(meta.signature())),
+                            ErrorVerb::Read,
+                            std::io::Error::new(std::io::ErrorKind::Other, e)
+                        )
+                    })?;
 
-impl MemStorage {
-    fn clone_storage(&self) -> Self {
-        Self {
-            vote: self.vote.clone(),
-            log: self.log.clone(),
-            state_machine: self.state_machine.clone(),
-            snapshot: self.snapshot.clone(),
-            snapshot_meta: self.snapshot_meta.clone(),
+                Ok(Some(Snapshot {
+                    meta,
+                    snapshot: Box::new(Cursor::new(bytes)),
+                }))
+            }
+            _ => Ok(None),
         }
     }
 }

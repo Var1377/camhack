@@ -10,6 +10,7 @@ struct RegisterWorkerRequest {
     task_arn: String,
     ip: String,
     port: u16,
+    game_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -36,6 +37,7 @@ pub async fn register_and_get_peer(
     worker_id: String,
     task_arn: String,
     my_ip: String,
+    game_id: String,
 ) -> Result<Option<PeerInfo>> {
     let master_url = env::var("MASTER_URL")
         .context("MASTER_URL environment variable not set")?;
@@ -43,12 +45,13 @@ pub async fn register_and_get_peer(
     let client = reqwest::Client::new();
 
     // Register ourselves with the master
-    println!("Registering with master at {}", master_url);
+    println!("Registering with master at {} for game {}", master_url, game_id);
     let register_req = RegisterWorkerRequest {
         worker_id: worker_id.clone(),
         task_arn,
         ip: my_ip,
         port: RAFT_PORT,
+        game_id: game_id.clone(),
     };
 
     let response: RegisterWorkerResponse = client
@@ -63,10 +66,10 @@ pub async fn register_and_get_peer(
 
     println!("Registration response: {}", response.message);
 
-    // Get a peer to join (if any exist)
-    println!("Requesting peer from master...");
+    // Get a peer to join (if any exist) for this specific game
+    println!("Requesting peer from master for game {}...", game_id);
     let peer_response: GetPeerResponse = client
-        .get(format!("{}/get_peer", master_url))
+        .get(format!("{}/get_peer?game_id={}", master_url, game_id))
         .send()
         .await
         .context("Failed to get peer from master")?
@@ -76,11 +79,11 @@ pub async fn register_and_get_peer(
 
     match (peer_response.peer_ip, peer_response.peer_port) {
         (Some(ip), Some(port)) => {
-            println!("Got peer from master: {}:{}", ip, port);
+            println!("Got peer from master for game {}: {}:{}", game_id, ip, port);
             Ok(Some(PeerInfo { ip, port }))
         }
         _ => {
-            println!("No peers available - will bootstrap new cluster");
+            println!("No peers available for game {} - will bootstrap new cluster", game_id);
             Ok(None)
         }
     }
