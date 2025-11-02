@@ -17,10 +17,15 @@ export interface BackendPlayerInfo {
   node_count: number;
 }
 
+// Backend sends AttackTarget as an enum: { Coordinate: {...} } | { Player: number }
+export type BackendAttackTarget =
+  | { Coordinate: BackendNodeCoord }
+  | { Player: number };
+
 export interface BackendNodeInfo {
   coord: BackendNodeCoord;
   owner_id: number | null;
-  current_target: BackendNodeCoord | null;
+  current_target: BackendAttackTarget | null;  // Updated to handle enum
   bandwidth_in?: number; // Bytes per second (optional - may not be available)
   packet_loss?: number; // 0.0 to 1.0 (optional - may not be available)
 }
@@ -33,6 +38,29 @@ export interface BackendGameState {
 
 export interface BackendError {
   error: string;
+}
+
+// Game Discovery Types (for lobby screen)
+export interface GameInfo {
+  game_id: string;
+  worker_count: number;
+  created_at_secs: number;
+}
+
+export interface GameListResponse {
+  games: GameInfo[];
+}
+
+export interface JoinRequest {
+  player_name: string;
+  game_id: string;
+}
+
+export interface JoinStatusResponse {
+  joined: boolean;
+  player_id?: number;
+  player_name?: string;
+  game_id?: string;
 }
 
 // Configuration
@@ -187,7 +215,11 @@ export async function pingBackend(): Promise<boolean> {
         'Content-Type': 'application/json',
       },
     });
-    return response.ok;
+    // Backend is reachable if we get ANY valid HTTP response (even errors)
+    // 200 = Game state returned successfully
+    // 400 = Not joined yet (but server is alive and responding)
+    // Both indicate backend is reachable
+    return response.ok || response.status === 400;
   } catch {
     return false;
   }
@@ -200,4 +232,112 @@ export function getBackendInfo(): { url: string; configured: boolean } {
   const url = getBackendUrl();
   const configured = !!import.meta.env.VITE_BACKEND_URL;
   return { url, configured };
+}
+
+/**
+ * Discover available games
+ * Calls client's /discover endpoint which queries the master
+ */
+export async function discoverGames(): Promise<GameListResponse> {
+  const url = `${getBackendUrl()}/discover`;
+
+  try {
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+    });
+
+    if (!response.ok) {
+      const errorData: BackendError = await response.json().catch(() => ({
+        error: `HTTP ${response.status}: ${response.statusText}`,
+      }));
+      throw new Error(`Failed to discover games: ${errorData.error}`);
+    }
+
+    const data: GameListResponse = await response.json();
+    return data;
+  } catch (error) {
+    if (error instanceof Error) {
+      console.error('Backend API Error:', error.message);
+      throw error;
+    }
+    throw new Error('Unknown error discovering games');
+  }
+}
+
+/**
+ * Join a game (creates new game if doesn't exist)
+ * @param playerName Player's display name
+ * @param gameId Game identifier (will be created if doesn't exist)
+ */
+export async function joinGameLobby(
+  playerName: string,
+  gameId: string
+): Promise<string> {
+  const url = `${getBackendUrl()}/join`;
+
+  try {
+    const request: JoinRequest = {
+      player_name: playerName,
+      game_id: gameId,
+    };
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(request),
+    });
+
+    if (!response.ok) {
+      const errorData: BackendError = await response.json().catch(() => ({
+        error: `HTTP ${response.status}: ${response.statusText}`,
+      }));
+      throw new Error(`Failed to join game: ${errorData.error}`);
+    }
+
+    const result = await response.text();
+    return result;
+  } catch (error) {
+    if (error instanceof Error) {
+      console.error('Backend API Error:', error.message);
+      throw error;
+    }
+    throw new Error('Unknown error joining game');
+  }
+}
+
+/**
+ * Check current join status
+ */
+export async function checkJoinStatus(): Promise<JoinStatusResponse> {
+  const url = `${getBackendUrl()}/status`;
+
+  try {
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+    });
+
+    if (!response.ok) {
+      const errorData: BackendError = await response.json().catch(() => ({
+        error: `HTTP ${response.status}: ${response.statusText}`,
+      }));
+      throw new Error(`Failed to check join status: ${errorData.error}`);
+    }
+
+    const data: JoinStatusResponse = await response.json();
+    return data;
+  } catch (error) {
+    if (error instanceof Error) {
+      console.error('Backend API Error:', error.message);
+      throw error;
+    }
+    throw new Error('Unknown error checking join status');
+  }
 }

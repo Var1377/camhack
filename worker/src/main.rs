@@ -54,8 +54,37 @@ async fn main() -> Result<()> {
         raft::bootstrap_cluster(node_id, my_ip.clone(), registry).await?
     };
 
-    // Step 7: Start HTTP API server for event submission
-    println!("\n[6/6] Starting HTTP API server...");
+    // Step 7: Check if this is a lazy-initialized node and submit completion event
+    let coord_q_result = std::env::var("NODE_COORD_Q").ok().and_then(|s| s.parse::<i32>().ok());
+    let coord_r_result = std::env::var("NODE_COORD_R").ok().and_then(|s| s.parse::<i32>().ok());
+
+    if let (Some(coord_q), Some(coord_r)) = (coord_q_result, coord_r_result) {
+        println!("\n[6/7] Lazy-initialized node detected: ({}, {})", coord_q, coord_r);
+        println!("Submitting NodeInitializationComplete event...");
+
+        use game::NodeCoord;
+        use game::GameEvent;
+        use raft::storage::GameEventRequest;
+
+        let node_coord = NodeCoord { q: coord_q, r: coord_r };
+        let event = GameEvent::NodeInitializationComplete {
+            node_coord,
+            node_ip: my_ip.clone(),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        };
+
+        let request = GameEventRequest { event };
+        match raft_node.raft.client_write(request).await {
+            Ok(_) => println!("✓ NodeInitializationComplete event submitted"),
+            Err(e) => eprintln!("⚠ Failed to submit NodeInitializationComplete: {}", e),
+        }
+    }
+
+    // Step 8: Start HTTP API server for event submission
+    println!("\n[7/7] Starting HTTP API server...");
     let api_raft = raft_node.raft.clone();
     let api_storage = raft_node.storage.clone();
     let api_addr = format!("0.0.0.0:8080");
@@ -68,7 +97,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    println!("\n[6/6] Worker startup complete!");
+    println!("\n[7/7] Worker startup complete!");
     println!("\n=== Worker Node Ready ===");
     println!("  Worker ID: {}", worker_id);
     println!("  Node ID: {}", node_id);
@@ -94,12 +123,14 @@ async fn main() -> Result<()> {
     // Main loop - run game logic tick and show status
     let mut tick_count = 0;
     let mut metrics_tick = 0;
+    let mut lazy_init_tick = 0;
     let mut final_kills_started = std::collections::HashSet::new();
 
     loop {
         sleep(Duration::from_secs(1)).await;
         tick_count += 1;
         metrics_tick += 1;
+        lazy_init_tick += 1;
 
         let is_leader = raft_node.is_leader().await;
 
@@ -143,6 +174,70 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
+            }
+        }
+
+        // Every 10 seconds, spawn neighbors for all non-neutral nodes (lazy initialization)
+        // Only leader runs this to avoid duplicate spawning
+        if is_leader && lazy_init_tick >= 10 && !game_state.game_over {
+            use game::NodeCoord;
+            use game::GameEvent;
+            use raft::storage::GameEventRequest;
+
+            lazy_init_tick = 0;
+
+            let mut nodes_to_spawn = std::collections::HashMap::<NodeCoord, u64>::new();
+
+            // Find all non-neutral nodes and check their neighbors
+            for (coord, node) in &game_state.nodes {
+                if node.owner_id != 0 {  // Non-neutral (owned by someone)
+                    // Get all 6 neighbors
+                    let neighbors = coord.neighbors();
+
+                    // Check which neighbors don't exist
+                    for neighbor_coord in neighbors {
+                        if !game_state.nodes.contains_key(&neighbor_coord) && !nodes_to_spawn.contains_key(&neighbor_coord) {
+                            nodes_to_spawn.insert(neighbor_coord, 0); // Neutral owner
+                        }
+                    }
+                }
+            }
+
+            if !nodes_to_spawn.is_empty() {
+                println!("[Lazy Init] Found {} neighbors to spawn around non-neutral nodes", nodes_to_spawn.len());
+
+                // Submit initialization events
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+
+                for (coord, owner) in &nodes_to_spawn {
+                    let event = GameEvent::NodeInitializationStarted {
+                        node_coord: *coord,
+                        owner_id: *owner,
+                        timestamp,
+                    };
+                    let request = GameEventRequest { event };
+
+                    if let Err(e) = raft_node.raft.client_write(request).await {
+                        eprintln!("[Lazy Init] Failed to submit initialization for {:?}: {}", coord, e);
+                    }
+                }
+
+                // Spawn workers on master (async)
+                let master_url = std::env::var("MASTER_URL")
+                    .unwrap_or_else(|_| "http://localhost:8080".to_string());
+                let game_id_clone = game_id.clone();
+                let nodes_to_spawn_clone = nodes_to_spawn.clone();
+
+                tokio::spawn(async move {
+                    for (coord, _) in nodes_to_spawn_clone {
+                        if let Err(e) = worker::raft::api::spawn_node_on_master(&master_url, &game_id_clone, coord.q, coord.r, false).await {
+                            eprintln!("[Lazy Init] Failed to spawn node {:?}: {}", coord, e);
+                        }
+                    }
+                });
             }
         }
 

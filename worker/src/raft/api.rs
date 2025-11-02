@@ -562,7 +562,7 @@ async fn handle_attack_websocket_axum(socket: axum::extract::ws::WebSocket) {
 }
 
 /// Helper function to spawn a node on master
-async fn spawn_node_on_master(
+pub async fn spawn_node_on_master(
     master_url: &str,
     game_id: &str,
     q: i32,

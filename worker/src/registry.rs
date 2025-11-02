@@ -69,7 +69,7 @@ pub async fn register_and_get_peer(
     // Get a peer to join (if any exist) for this specific game
     println!("Requesting peer from master for game {}...", game_id);
     let peer_response: GetPeerResponse = client
-        .get(format!("{}/get_peer?game_id={}", master_url, game_id))
+        .get(format!("{}/get_peer?game_id={}&requesting_ip={}", master_url, game_id, register_req.ip))
         .send()
         .await
         .context("Failed to get peer from master")?

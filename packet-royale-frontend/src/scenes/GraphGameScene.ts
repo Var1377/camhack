@@ -18,6 +18,7 @@ import { COLORS, VISUAL_CONFIG, getPlayerColor, getBandwidthColor } from '../con
 import { fetchGameState, pingBackend } from '../services/backendApi';
 import { transformBackendToGraph } from '../adapters/graphBackendAdapter';
 import { getBackendConfig, isBackendEnabled, debugLog, errorLog } from '../config/backend';
+import { getWebSocketService, type GameStateUpdate } from '../services/websocketService';
 
 export class GraphGameScene extends Phaser.Scene {
   private gameState!: NetworkGameState;
@@ -52,6 +53,9 @@ export class GraphGameScene extends Phaser.Scene {
   private useBackend = false;
   private backendConnected = false;
   private currentPlayerId = 0; // Default to player 0
+  private wsConnected = false;
+  private pollingTimer?: Phaser.Time.TimerEvent;
+  private lastLogIndex = 0;
 
   constructor() {
     super({ key: 'GraphGameScene' });
@@ -66,7 +70,15 @@ export class GraphGameScene extends Phaser.Scene {
     graphics.destroy();
   }
 
-  async create() {
+  async create(data: { playerId?: number } = {}) {
+    // Set player ID from scene data (passed from LobbyScene)
+    if (data.playerId !== undefined) {
+      this.currentPlayerId = data.playerId;
+      console.log('GraphGameScene: Using player_id from scene data:', this.currentPlayerId);
+    } else {
+      console.warn('GraphGameScene: No player_id provided, using default 0');
+    }
+
     // Check if backend is enabled and reachable
     if (isBackendEnabled()) {
       debugLog('Checking backend connection...');
@@ -132,18 +144,22 @@ export class GraphGameScene extends Phaser.Scene {
     });
     console.log('✅ GraphGameScene: Listening for captureModeChanged events from UIScene');
 
-    // Start update loop
-    const config = getBackendConfig();
-    const updateDelay = this.useBackend ? config.pollingInterval : 100;
-    this.time.addEvent({
-      delay: updateDelay,
-      callback: this.updateGameState,
-      callbackScope: this,
-      loop: true,
-    });
+    // Start update mechanism (WebSocket with polling fallback)
+    if (this.useBackend) {
+      try {
+        await this.setupWebSocket();
+      } catch (error) {
+        errorLog('WebSocket setup failed, falling back to polling', error);
+        this.startPolling();
+      }
+    } else {
+      // Dummy data mode - use fast polling
+      this.startDummyPolling();
+    }
 
     console.log('GraphGameScene initialized with', this.gameState.nodes.size, 'nodes');
     console.log('Backend mode:', this.useBackend ? 'ENABLED' : 'DISABLED (dummy data)');
+    console.log('Update mode:', this.wsConnected ? 'WebSocket' : 'HTTP Polling');
   }
 
   private setupCamera() {
@@ -157,7 +173,7 @@ export class GraphGameScene extends Phaser.Scene {
 
     // Zoom keys (+ and - or = and -)
     this.zoomKeys = {
-      plus: this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.EQUALS),
+      plus: this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.PLUS),
       minus: this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.MINUS),
     };
 
@@ -826,23 +842,96 @@ export class GraphGameScene extends Phaser.Scene {
     });
   }
 
-  private async updateGameState() {
-    if (this.useBackend) {
-      // Fetch from backend
-      try {
-        const backendState = await fetchGameState();
-        this.gameState = transformBackendToGraph(backendState, this.currentPlayerId);
-      } catch (error) {
-        errorLog('Failed to update game state from backend', error);
-        // Fall back to dummy data on error
-        this.useBackend = false;
-        this.gameState = generateNetworkGameState();
+  private async setupWebSocket() {
+    const wsService = getWebSocketService();
+
+    debugLog('[WebSocket] Setting up connection...');
+
+    // Connect to WebSocket
+    wsService.connect();
+
+    // On update notification → fetch full state
+    wsService.onUpdate((update: GameStateUpdate) => {
+      debugLog('[WebSocket] Update received, log_index:', update.log_index);
+
+      // Only fetch if log index changed
+      if (update.log_index > this.lastLogIndex) {
+        this.lastLogIndex = update.log_index;
+        this.fetchAndUpdateGameState();
       }
-    } else {
-      // Update dummy data
-      updateNetworkGameState(this.gameState);
+    });
+
+    // On connection change
+    wsService.onConnectionChange((connected: boolean) => {
+      debugLog('[WebSocket] Connection status changed:', connected);
+      this.wsConnected = connected;
+
+      if (!connected) {
+        errorLog('[WebSocket] Disconnected, falling back to polling');
+        this.startPolling();
+      } else {
+        debugLog('[WebSocket] Connected, stopping polling');
+        this.stopPolling();
+      }
+    });
+
+    // On error
+    wsService.onError((error: Error) => {
+      errorLog('[WebSocket] Error:', error.message);
+    });
+
+    debugLog('[WebSocket] Setup complete');
+  }
+
+  private startPolling() {
+    if (this.pollingTimer) {
+      debugLog('[Polling] Already active');
+      return;
     }
 
+    const config = getBackendConfig();
+    this.pollingTimer = this.time.addEvent({
+      delay: config.pollingInterval,
+      callback: this.fetchAndUpdateGameState,
+      callbackScope: this,
+      loop: true,
+    });
+
+    debugLog('[Polling] Started HTTP polling (interval:', config.pollingInterval, 'ms)');
+  }
+
+  private stopPolling() {
+    if (this.pollingTimer) {
+      this.pollingTimer.destroy();
+      this.pollingTimer = undefined;
+      debugLog('[Polling] Stopped HTTP polling');
+    }
+  }
+
+  private startDummyPolling() {
+    if (this.pollingTimer) return;
+
+    this.pollingTimer = this.time.addEvent({
+      delay: 100,
+      callback: this.updateGameState,
+      callbackScope: this,
+      loop: true,
+    });
+
+    debugLog('[Polling] Started dummy data polling');
+  }
+
+  private async fetchAndUpdateGameState() {
+    try {
+      const backendState = await fetchGameState();
+      this.gameState = transformBackendToGraph(backendState, this.currentPlayerId);
+      this.updateVisuals();
+    } catch (error) {
+      errorLog('Failed to fetch game state', error);
+    }
+  }
+
+  private updateVisuals() {
     this.updateCapturableNodes();
     this.updateCapturableConnections();
 
@@ -856,6 +945,17 @@ export class GraphGameScene extends Phaser.Scene {
     this.drawFogOfWar();
 
     this.events.emit('gameStateUpdated', this.gameState);
+  }
+
+  private async updateGameState() {
+    if (this.useBackend) {
+      // This is now only used when WebSocket is not available
+      await this.fetchAndUpdateGameState();
+    } else {
+      // Update dummy data
+      updateNetworkGameState(this.gameState);
+      this.updateVisuals();
+    }
   }
 
   update() {

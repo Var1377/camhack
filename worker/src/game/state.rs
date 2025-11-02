@@ -182,16 +182,19 @@ impl GameState {
                 owner_id,
                 ..
             } => {
-                // Create placeholder node in Initializing state
-                let node = Node {
-                    coord: node_coord,
-                    owner_id,
-                    node_type: NodeType::Regular,  // Lazily initialized nodes are regular
-                    current_target: None,
-                    is_client: false,
-                    init_state: NodeInitState::Initializing,
-                };
-                self.nodes.insert(node_coord, node);
+                // Only insert if node doesn't already exist (deduplication)
+                if !self.nodes.contains_key(&node_coord) {
+                    // Create placeholder node in Initializing state
+                    let node = Node {
+                        coord: node_coord,
+                        owner_id,
+                        node_type: NodeType::Regular,  // Lazily initialized nodes are regular
+                        current_target: None,
+                        is_client: false,
+                        init_state: NodeInitState::Initializing,
+                    };
+                    self.nodes.insert(node_coord, node);
+                }
             }
 
             GameEvent::NodeInitializationComplete {

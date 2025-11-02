@@ -22,52 +22,93 @@ YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 # ====================
-# Phase 1: Build
+# Phase 0: Check for existing MASTER_IP
 # ====================
-echo -e "${GREEN}[Phase 1/5] Building all components...${NC}"
-echo ""
+if [ -n "$MASTER_IP" ]; then
+    echo -e "${YELLOW}[INFO] MASTER_IP environment variable is set: $MASTER_IP${NC}"
+    echo "Validating master accessibility..."
+    echo ""
 
-# Build Master
-echo "Building master Docker image..."
-cd "$REPO_ROOT/master"
-if [ -f "scripts/build.sh" ]; then
-    ./scripts/build.sh
+    # Validate IP format
+    if ! [[ "$MASTER_IP" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        echo -e "${RED}Error: MASTER_IP has invalid format${NC}"
+        echo "Expected format: XXX.XXX.XXX.XXX (e.g., 54.123.45.67)"
+        exit 1
+    fi
+
+    # Test connectivity with timeout
+    MASTER_URL="http://$MASTER_IP:8080"
+    if timeout 5 curl -f -s "$MASTER_URL/" > /dev/null 2>&1; then
+        echo -e "${GREEN}✓ Master is reachable at $MASTER_URL${NC}"
+        echo -e "${GREEN}✓ Will skip master deployment and use existing master${NC}"
+        SKIP_MASTER_DEPLOY=true
+    else
+        echo -e "${RED}Error: Master not reachable at $MASTER_URL${NC}"
+        echo ""
+        echo "Options:"
+        echo "  1. Unset MASTER_IP to deploy new master:"
+        echo "     unset MASTER_IP && ./deploy-all.sh"
+        echo ""
+        echo "  2. Verify master is running:"
+        echo "     aws ecs list-tasks --cluster $CLUSTER_NAME --region $AWS_REGION"
+        echo ""
+        echo "  3. Check master logs:"
+        echo "     aws logs tail /ecs/master --follow --region $AWS_REGION"
+        exit 1
+    fi
 else
-    echo "Building master manually..."
-    docker build -t camhack-master .
-    docker tag camhack-master:latest "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/camhack-master:latest"
-    aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
-    docker push "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/camhack-master:latest"
+    echo -e "${YELLOW}[INFO] MASTER_IP not set, will deploy new master${NC}"
+    SKIP_MASTER_DEPLOY=false
 fi
-echo -e "${GREEN}✓ Master built and pushed${NC}"
-echo ""
-
-# Build Worker
-echo "Building worker Docker image..."
-cd "$REPO_ROOT/worker"
-if [ -f "scripts/build.sh" ]; then
-    ./scripts/build.sh
-else
-    echo "Building worker manually..."
-    docker build -t camhack-worker .
-    docker tag camhack-worker:latest "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/camhack-worker:latest"
-    aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
-    docker push "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/camhack-worker:latest"
-fi
-echo -e "${GREEN}✓ Worker built and pushed${NC}"
-echo ""
-
-# Build Client
-echo "Building client binary (release mode)..."
-cd "$REPO_ROOT/client"
-cargo build --release
-echo -e "${GREEN}✓ Client built${NC}"
 echo ""
 
 # ====================
-# Phase 2: Kill Existing Instances
+# Phase 1: Build (COMMENTED OUT - Run build scripts separately)
 # ====================
-echo -e "${YELLOW}[Phase 2/5] Killing all existing instances (auto-cleanup)...${NC}"
+# echo -e "${GREEN}[Phase 1/5] Building all components...${NC}"
+# echo ""
+#
+# # Build Master
+# echo "Building master Docker image..."
+# cd "$REPO_ROOT/master"
+# if [ -f "scripts/build.sh" ]; then
+#     ./scripts/build.sh
+# else
+#     echo "Building master manually..."
+#     docker build -t camhack-master .
+#     docker tag camhack-master:latest "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/camhack-master:latest"
+#     aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+#     docker push "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/camhack-master:latest"
+# fi
+# echo -e "${GREEN}✓ Master built and pushed${NC}"
+# echo ""
+#
+# # Build Worker
+# echo "Building worker Docker image..."
+# cd "$REPO_ROOT/worker"
+# if [ -f "scripts/build.sh" ]; then
+#     ./scripts/build.sh
+# else
+#     echo "Building worker manually..."
+#     docker build -t camhack-worker .
+#     docker tag camhack-worker:latest "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/camhack-worker:latest"
+#     aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+#     docker push "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/camhack-worker:latest"
+# fi
+# echo -e "${GREEN}✓ Worker built and pushed${NC}"
+# echo ""
+#
+# # Build Client
+# echo "Building client binary (release mode)..."
+# cd "$REPO_ROOT/client"
+# cargo build --release
+# echo -e "${GREEN}✓ Client built${NC}"
+# echo ""
+
+# ====================
+# Phase 1: Kill Existing Instances
+# ====================
+echo -e "${YELLOW}[Phase 1/4] Killing all existing instances (auto-cleanup)...${NC}"
 echo ""
 
 # Kill ECS tasks
@@ -134,76 +175,102 @@ fi
 echo ""
 
 # ====================
-# Phase 3: Deploy Master
+# Phase 2: Deploy Master
 # ====================
-echo -e "${GREEN}[Phase 3/5] Deploying master to AWS ECS...${NC}"
-echo ""
+if [ "$SKIP_MASTER_DEPLOY" = false ]; then
+    echo -e "${GREEN}[Phase 2/4] Deploying master to AWS ECS...${NC}"
+    echo ""
 
-cd "$REPO_ROOT/master"
-if [ -f "scripts/deploy.sh" ]; then
-    # Run deploy script (it will register task definition and run task)
-    ./scripts/deploy.sh
-else
-    echo -e "${RED}Error: master/scripts/deploy.sh not found${NC}"
-    exit 1
-fi
-
-echo ""
-echo "Waiting 30 seconds for master to start..."
-sleep 30
-
-# ====================
-# Phase 4: Get Master IP
-# ====================
-echo -e "${GREEN}[Phase 4/5] Retrieving master IP...${NC}"
-echo ""
-
-cd "$REPO_ROOT/master"
-if [ -f "scripts/get-ip.sh" ]; then
-    MASTER_IP=$(./scripts/get-ip.sh | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
-else
-    # Fallback: manual retrieval
-    TASK_ARN=$(aws ecs list-tasks \
-        --cluster "$CLUSTER_NAME" \
-        --family master-node \
-        --desired-status RUNNING \
-        --region "$AWS_REGION" \
-        --query 'taskArns[0]' \
-        --output text)
-
-    if [ "$TASK_ARN" == "None" ] || [ -z "$TASK_ARN" ]; then
-        echo -e "${RED}Error: Master task not running${NC}"
+    cd "$REPO_ROOT/master"
+    if [ -f "scripts/deploy.sh" ]; then
+        # Run deploy script (it will register task definition and run task)
+        ./scripts/deploy.sh
+    else
+        echo -e "${RED}Error: master/scripts/deploy.sh not found${NC}"
         exit 1
     fi
 
-    ENI_ID=$(aws ecs describe-tasks \
-        --cluster "$CLUSTER_NAME" \
-        --tasks "$TASK_ARN" \
-        --region "$AWS_REGION" \
-        --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value' \
-        --output text)
-
-    MASTER_IP=$(aws ec2 describe-network-interfaces \
-        --network-interface-ids "$ENI_ID" \
-        --region "$AWS_REGION" \
-        --query 'NetworkInterfaces[0].Association.PublicIp' \
-        --output text)
+    echo ""
+    echo "Waiting 30 seconds for master to start..."
+    sleep 30
+else
+    echo -e "${YELLOW}[Phase 2/4] Skipping master deployment (using existing MASTER_IP=$MASTER_IP)${NC}"
+    echo ""
 fi
 
-if [ -z "$MASTER_IP" ] || [ "$MASTER_IP" == "None" ]; then
-    echo -e "${RED}Error: Failed to retrieve master IP${NC}"
-    exit 1
+# ====================
+# Phase 3: Get Master IP
+# ====================
+if [ "$SKIP_MASTER_DEPLOY" = false ]; then
+    echo -e "${GREEN}[Phase 3/4] Retrieving master IP from AWS...${NC}"
+    echo ""
+
+    cd "$REPO_ROOT/master"
+    if [ -f "scripts/get-ip.sh" ]; then
+        MASTER_IP=$(./scripts/get-ip.sh | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
+    else
+        # Fallback: manual retrieval
+        TASK_ARN=$(aws ecs list-tasks \
+            --cluster "$CLUSTER_NAME" \
+            --family master-node \
+            --desired-status RUNNING \
+            --region "$AWS_REGION" \
+            --query 'taskArns[0]' \
+            --output text)
+
+        if [ "$TASK_ARN" == "None" ] || [ -z "$TASK_ARN" ]; then
+            echo -e "${RED}Error: Master task not running${NC}"
+            exit 1
+        fi
+
+        ENI_ID=$(aws ecs describe-tasks \
+            --cluster "$CLUSTER_NAME" \
+            --tasks "$TASK_ARN" \
+            --region "$AWS_REGION" \
+            --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value' \
+            --output text)
+
+        MASTER_IP=$(aws ec2 describe-network-interfaces \
+            --network-interface-ids "$ENI_ID" \
+            --region "$AWS_REGION" \
+            --query 'NetworkInterfaces[0].Association.PublicIp' \
+            --output text)
+    fi
+
+    if [ -z "$MASTER_IP" ] || [ "$MASTER_IP" == "None" ]; then
+        echo -e "${RED}Error: Failed to retrieve master IP${NC}"
+        exit 1
+    fi
+else
+    echo -e "${GREEN}[Phase 3/4] Using existing MASTER_IP${NC}"
+    echo ""
 fi
 
+# Always set MASTER_URL consistently (whether retrieved or provided)
 echo -e "${GREEN}✓ Master IP: $MASTER_IP${NC}"
 MASTER_URL="http://$MASTER_IP:8080"
 echo "Master URL: $MASTER_URL"
 echo ""
 
 # ====================
-# Phase 5: Start Client & Frontend
+# Phase 4: Register Worker Task Definitions & Start Client
 # ====================
-echo -e "${GREEN}[Phase 5/5] Starting client and frontend...${NC}"
+echo -e "${GREEN}[Phase 4/4] Registering worker task definitions & starting client...${NC}"
+echo ""
+
+# Export MASTER_IP for worker deploy script to use
+export MASTER_IP
+
+# Call worker deploy script to register task definitions with correct master IP
+cd "$REPO_ROOT/worker"
+if [ -f "scripts/deploy.sh" ]; then
+    echo "Running worker deploy script..."
+    ./scripts/deploy.sh
+    echo ""
+    echo -e "${GREEN}✓ Worker task definitions registered${NC}"
+else
+    echo -e "${YELLOW}Warning: worker/scripts/deploy.sh not found, skipping worker task registration${NC}"
+fi
 echo ""
 
 # Start client in background

@@ -11,6 +11,7 @@ pub struct PlayerContext {
     pub player_id: u64,
     pub player_name: String,
     pub capital_coord: NodeCoord,
+    pub game_id: String,
 }
 
 /// Client state shared across HTTP handlers
@@ -70,6 +71,35 @@ fn current_timestamp() -> u64 {
         .as_micros() as u64
 }
 
+/// Wait for Raft leader election to complete
+async fn wait_for_leader(raft_node: &Arc<RaftNode>, timeout: std::time::Duration) -> Result<u64> {
+    use std::time::Instant;
+    use tokio::time::sleep;
+
+    let start = Instant::now();
+    let poll_interval = std::time::Duration::from_millis(100);
+
+    loop {
+        // Check if we've exceeded the timeout
+        if start.elapsed() >= timeout {
+            return Err(anyhow::anyhow!(
+                "Timeout waiting for leader election after {:?}", timeout
+            ));
+        }
+
+        // Get current Raft metrics to check for leader
+        let metrics = raft_node.raft.metrics().borrow().clone();
+
+        if let Some(leader_id) = metrics.current_leader {
+            println!("✓ Leader elected: node {}", leader_id);
+            return Ok(leader_id);
+        }
+
+        // No leader yet, wait and retry
+        sleep(poll_interval).await;
+    }
+}
+
 /// Find a random unoccupied coordinate for the capital
 async fn find_random_unoccupied_coord(raft_node: &Arc<RaftNode>) -> Result<NodeCoord> {
     let storage = raft_node.storage.read().await;
@@ -106,12 +136,14 @@ async fn start_api_server(state: ClientState, addr: String) -> Result<()> {
             ws::{Message, WebSocket},
             State, WebSocketUpgrade,
         },
+        http::StatusCode,
         response::Response,
         routing::{get, post},
         Json, Router,
     };
     use serde::{Deserialize, Serialize};
     use tower_http::cors::CorsLayer;
+    use tower_http::services::ServeDir;
 
     #[derive(Serialize)]
     struct PlayerStatusResponse {
@@ -200,6 +232,100 @@ async fn start_api_server(state: ClientState, addr: String) -> Result<()> {
             .collect();
 
         Ok(Json(node_infos))
+    }
+
+    // GET /game/state - Get full game state (for frontend visualization)
+    async fn get_game_state(
+        State(state): State<ClientState>,
+    ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+        // Check if joined
+        let raft_node = state.raft_node.read().await;
+        let raft_node = raft_node.as_ref()
+            .ok_or_else(|| (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Not joined to any game. Call POST /join first"}))
+            ))?;
+
+        let storage = raft_node.storage.read().await;
+        let sm_arc = storage.state_machine();
+        drop(storage);
+        let sm = sm_arc.read().await;
+
+        // Serialize full game state for frontend
+        let game_state_json = serde_json::json!({
+            "players": sm.game_state.players.iter().map(|(id, p)| {
+                // Count nodes owned by this player
+                let node_count = sm.game_state.nodes.values()
+                    .filter(|n| n.owner_id == *id)
+                    .count();
+
+                serde_json::json!({
+                    "player_id": id,  // Fixed: was "id", now "player_id"
+                    "name": &p.name,
+                    "capital_coord": {
+                        "q": p.capital_coord.q,
+                        "r": p.capital_coord.r
+                    },
+                    "alive": p.alive,
+                    "join_time": p.join_time,
+                    "node_count": node_count  // Added: node count for UI
+                })
+            }).collect::<Vec<_>>(),
+            "nodes": sm.game_state.nodes.iter().map(|(coord, node)| {
+                // Properly serialize current_target as JSON object
+                let current_target_json = node.current_target.as_ref().map(|t| match t {
+                    worker::game::AttackTarget::Coordinate(target_coord) => {
+                        serde_json::json!({
+                            "q": target_coord.q,
+                            "r": target_coord.r
+                        })
+                    },
+                    worker::game::AttackTarget::Player(player_id) => {
+                        serde_json::json!({
+                            "player_id": player_id
+                        })
+                    },
+                });
+
+                // Get metrics for this node if available
+                let metrics = sm.game_state.node_metrics.get(coord);
+
+                serde_json::json!({
+                    "coord": {
+                        "q": coord.q,
+                        "r": coord.r
+                    },
+                    "owner_id": node.owner_id,
+                    "current_target": current_target_json,
+                    "bandwidth_in": metrics.map(|m| m.bandwidth_in),
+                    "packet_loss": metrics.map(|m| m.packet_loss),
+                })
+            }).collect::<Vec<_>>(),
+            "total_events": sm.events.len()
+        });
+
+        Ok(Json(game_state_json))
+    }
+
+    // POST /events - Submit a custom game event (for advanced frontend features)
+    async fn submit_event(
+        State(state): State<ClientState>,
+        Json(event_json): Json<serde_json::Value>,
+    ) -> Result<Json<String>, String> {
+        // Check if joined
+        let raft_node = state.raft_node.read().await;
+        let raft_node = raft_node.as_ref()
+            .ok_or("Not joined to any game. Call POST /join first".to_string())?;
+
+        // Parse event from JSON (simplified for now - only supports SetNodeTarget)
+        let event: GameEvent = serde_json::from_value(event_json)
+            .map_err(|e| format!("Failed to parse event: {}", e))?;
+
+        let request = GameEventRequest { event };
+        raft_node.raft.client_write(request).await
+            .map_err(|e| format!("Failed to submit event: {}", e))?;
+
+        Ok(Json("Event submitted successfully".to_string()))
     }
 
     // POST /my/attack - Set attack target for a node
@@ -382,6 +508,7 @@ async fn start_api_server(state: ClientState, addr: String) -> Result<()> {
                 "joined": true,
                 "player_id": ctx.player_id,
                 "player_name": ctx.player_name,
+                "game_id": ctx.game_id,
                 "capital_coord": { "q": ctx.capital_coord.q, "r": ctx.capital_coord.r }
             })
         } else {
@@ -441,6 +568,11 @@ async fn start_api_server(state: ClientState, addr: String) -> Result<()> {
             bootstrap_cluster(node_id, my_ip.clone(), registry).await
         }.map_err(|e| format!("Failed to initialize Raft: {}", e))?;
 
+        // Wait for leader election to complete before proceeding
+        println!("Waiting for Raft leader election...");
+        wait_for_leader(&raft_node, std::time::Duration::from_secs(10)).await
+            .map_err(|e| format!("Leader election failed: {}", e))?;
+
         // Initialize player
         let player_id = generate_player_id();
         let capital_coord = find_random_unoccupied_coord(&raft_node).await
@@ -465,12 +597,40 @@ async fn start_api_server(state: ClientState, addr: String) -> Result<()> {
             player_id,
             player_name: req.player_name.clone(),
             capital_coord,
+            game_id: req.game_id.clone(),
         };
 
         *state.player_context.write().await = Some(player_ctx);
         *state.raft_node.write().await = Some(raft_node);
 
         println!("✓ Successfully joined game: {}", req.game_id);
+
+        // Spawn capital worker for this player
+        println!("Spawning capital worker at ({}, {})...", capital_coord.q, capital_coord.r);
+        let client = reqwest::Client::new();
+        let spawn_result = client
+            .post(format!("{}/spawn_single_node", state.master_url.as_str()))
+            .json(&serde_json::json!({
+                "game_id": req.game_id,
+                "is_capital": true,
+                "q": capital_coord.q,
+                "r": capital_coord.r
+            }))
+            .send()
+            .await;
+
+        match spawn_result {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    println!("✓ Capital worker spawned successfully");
+                } else {
+                    eprintln!("⚠ Failed to spawn capital worker: {}", resp.status());
+                }
+            }
+            Err(e) => {
+                eprintln!("⚠ Failed to spawn capital worker: {}", e);
+            }
+        }
 
         Ok(Json(format!("Successfully joined game {} as {}", req.game_id, req.player_name)))
     }
@@ -518,8 +678,11 @@ async fn start_api_server(state: ClientState, addr: String) -> Result<()> {
         .route("/my/status", get(get_player_status))
         .route("/my/nodes", get(get_player_nodes))
         .route("/my/attack", post(set_attack_target))
+        .route("/game/state", get(get_game_state))
+        .route("/events", post(submit_event))
         .route("/ws", get(websocket_handler))
         .route("/finalkill", get(finalkill_handler))
+        .nest_service("/", ServeDir::new("static").append_index_html_on_directories(true))
         .layer(CorsLayer::permissive())  // Enable CORS for frontend
         .with_state(state);
 

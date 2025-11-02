@@ -4,12 +4,12 @@
   "requiresCompatibilities": ["FARGATE"],
   "cpu": "256",
   "memory": "512",
-  "executionRoleArn": "arn:aws:iam::YOUR_ACCOUNT_ID:role/ecsTaskExecutionRole",
-  "taskRoleArn": "arn:aws:iam::YOUR_ACCOUNT_ID:role/ecsMasterTaskRole",
+  "executionRoleArn": "arn:aws:iam::267537957970:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::267537957970:role/ecsMasterTaskRole",
   "containerDefinitions": [
     {
       "name": "master-node",
-      "image": "YOUR_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/master-node:latest",
+      "image": "267537957970.dkr.ecr.us-east-1.amazonaws.com/master-node:latest",
       "essential": true,
       "portMappings": [
         {

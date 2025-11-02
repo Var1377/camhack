@@ -84,6 +84,7 @@ struct RegisterWorkerResponse {
 #[derive(Deserialize)]
 struct GetPeerQuery {
     game_id: String,
+    requesting_ip: String,
 }
 
 #[derive(Serialize)]
@@ -122,11 +123,15 @@ struct SpawnSingleNodeResponse {
 #[tokio::main]
 async fn main() {
     eprintln!("=== MASTER NODE STARTING ===");
-    std::io::stderr().flush().unwrap();
+    if let Err(e) = std::io::stderr().flush() {
+        eprintln!("Warning: Failed to flush stderr: {}", e);
+    }
 
     // Load AWS configuration
+    eprintln!("Loading AWS configuration...");
     let config = aws_config::load_from_env().await;
     let ecs_client = EcsClient::new(&config);
+    eprintln!("✓ AWS configuration loaded");
 
     // Get configuration from environment
     let cluster_name = std::env::var("CLUSTER_NAME")
@@ -135,13 +140,52 @@ async fn main() {
         .unwrap_or_else(|_| "worker".to_string());
     let capital_task_definition = std::env::var("CAPITAL_TASK_DEFINITION")
         .unwrap_or_else(|_| "worker-capital".to_string());
-    let subnet_id = std::env::var("SUBNET_ID")
-        .expect("SUBNET_ID environment variable required");
-    let security_group_id = std::env::var("SECURITY_GROUP_ID")
-        .expect("SECURITY_GROUP_ID environment variable required");
+
+    // Validate required environment variables with helpful error messages
+    let subnet_id = match std::env::var("SUBNET_ID") {
+        Ok(val) => {
+            if val.is_empty() || val == "WILL_BE_SET_BY_DEPLOY_SCRIPT" {
+                eprintln!("ERROR: SUBNET_ID is set but has invalid value: '{}'", val);
+                eprintln!("Please ensure the deploy script properly sets this value.");
+                std::process::exit(1);
+            }
+            eprintln!("✓ SUBNET_ID: {}", val);
+            val
+        }
+        Err(_) => {
+            eprintln!("ERROR: SUBNET_ID environment variable is required but not set");
+            eprintln!("This variable should contain the AWS subnet ID where workers will be launched.");
+            eprintln!("Example: subnet-12345abcde");
+            std::process::exit(1);
+        }
+    };
+
+    let security_group_id = match std::env::var("SECURITY_GROUP_ID") {
+        Ok(val) => {
+            if val.is_empty() || val == "WILL_BE_SET_BY_DEPLOY_SCRIPT" {
+                eprintln!("ERROR: SECURITY_GROUP_ID is set but has invalid value: '{}'", val);
+                eprintln!("Please ensure the deploy script properly sets this value.");
+                std::process::exit(1);
+            }
+            eprintln!("✓ SECURITY_GROUP_ID: {}", val);
+            val
+        }
+        Err(_) => {
+            eprintln!("ERROR: SECURITY_GROUP_ID environment variable is required but not set");
+            eprintln!("This variable should contain the AWS security group ID for workers.");
+            eprintln!("Example: sg-12345abcde");
+            std::process::exit(1);
+        }
+    };
 
     // Try to get our own task ARN (for self-kill)
     let self_task_arn = std::env::var("SELF_TASK_ARN").ok();
+
+    eprintln!("Configuration:");
+    eprintln!("  Cluster: {}", cluster_name);
+    eprintln!("  Worker task def: {}", task_definition);
+    eprintln!("  Capital task def: {}", capital_task_definition);
+    eprintln!("  Self task ARN: {:?}", self_task_arn);
 
     let state = AppState {
         ecs_client,
@@ -168,12 +212,20 @@ async fn main() {
         .with_state(state);
 
     // Start HTTP server
-    let port = std::env::var("PORT")
+    let port = match std::env::var("PORT")
         .unwrap_or_else(|_| "8080".to_string())
         .parse::<u16>()
-        .expect("Invalid PORT");
+    {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("ERROR: Invalid PORT value: {}", e);
+            eprintln!("PORT must be a valid number between 1 and 65535");
+            std::process::exit(1);
+        }
+    };
 
     let addr = format!("0.0.0.0:{}", port);
+    eprintln!("\n=== STARTING HTTP SERVER ===");
     println!("Master node listening on {}", addr);
     println!("Endpoints:");
     println!("  GET  /                - Health check");
@@ -185,8 +237,28 @@ async fn main() {
     println!("  POST /register_worker - Register worker with master");
     println!("  GET  /get_peer?game_id=X - Get a peer for joining cluster");
 
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let listener = match tokio::net::TcpListener::bind(&addr).await {
+        Ok(l) => {
+            eprintln!("✓ Successfully bound to {}", addr);
+            l
+        }
+        Err(e) => {
+            eprintln!("ERROR: Failed to bind to {}: {}", addr, e);
+            eprintln!("Possible causes:");
+            eprintln!("  - Port {} is already in use", port);
+            eprintln!("  - Insufficient permissions to bind to this address");
+            eprintln!("  - Network configuration issue");
+            std::process::exit(1);
+        }
+    };
+
+    eprintln!("✓ Master node is ready and listening");
+    eprintln!("=================================\n");
+
+    if let Err(e) = axum::serve(listener, app).await {
+        eprintln!("ERROR: Server failed: {}", e);
+        std::process::exit(1);
+    }
 }
 
 async fn health_check() -> &'static str {
@@ -268,7 +340,7 @@ async fn spawn_workers(
                         .security_groups(&state.security_group_id)
                         .assign_public_ip(aws_sdk_ecs::types::AssignPublicIp::Enabled)
                         .build()
-                        .unwrap(),
+                        .expect("Failed to build AWS VPC configuration - this should not happen with valid subnet and security group IDs"),
                 )
                 .build(),
         )
@@ -374,7 +446,7 @@ async fn spawn_single_node(
                         .security_groups(&state.security_group_id)
                         .assign_public_ip(aws_sdk_ecs::types::AssignPublicIp::Enabled)
                         .build()
-                        .unwrap(),
+                        .expect("Failed to build AWS VPC configuration - this should not happen with valid subnet and security group IDs"),
                 )
                 .build(),
         )
@@ -549,19 +621,28 @@ async fn get_peer(
 
     // Look for the requested game
     if let Some(game_cluster) = games.get(&params.game_id) {
-        if game_cluster.workers.is_empty() {
-            println!("No peers available for game {} - this will be the first worker", params.game_id);
+        // Filter out the requesting node itself to prevent self-join
+        let available_peers: Vec<_> = game_cluster.workers.iter()
+            .filter(|(_, info)| info.ip != params.requesting_ip)
+            .collect();
+
+        if available_peers.is_empty() {
+            // Only the requesting node exists in the game (or game is empty)
+            println!(
+                "No other peers available for game {} (requesting IP: {}) - will bootstrap new cluster",
+                params.game_id, params.requesting_ip
+            );
             return Json(GetPeerResponse {
                 peer_ip: None,
                 peer_port: None,
             });
         }
 
-        // Return a peer from this game (just pick the first one for simplicity)
-        if let Some((_worker_id, worker_info)) = game_cluster.workers.iter().next() {
+        // Return first available peer that isn't the requester
+        if let Some((_worker_id, worker_info)) = available_peers.first() {
             println!(
-                "Returning peer for game {}: {}:{}",
-                params.game_id, worker_info.ip, worker_info.port
+                "Returning peer for game {}: {}:{} (excluding requester {})",
+                params.game_id, worker_info.ip, worker_info.port, params.requesting_ip
             );
             return Json(GetPeerResponse {
                 peer_ip: Some(worker_info.ip.clone()),

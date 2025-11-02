@@ -14,7 +14,22 @@ import type {
   BackendNodeCoord,
   BackendPlayerInfo,
   BackendNodeInfo,
+  BackendAttackTarget,
 } from '../services/backendApi';
+
+/**
+ * Extract coordinate from AttackTarget enum
+ * Backend sends { Coordinate: {q, r} } or { Player: id }
+ * We only care about coordinate attacks for visualization
+ */
+function extractTargetCoord(target: BackendAttackTarget | null): BackendNodeCoord | null {
+  if (!target) return null;
+  // Check if it's a Coordinate attack (not Player attack)
+  if ('Coordinate' in target) {
+    return target.Coordinate;
+  }
+  return null; // Player attacks don't have coordinates
+}
 
 // Player color palette (matches frontend visual constants)
 const PLAYER_COLORS = [
@@ -129,8 +144,9 @@ function calculateVisibility(
 
   // Also mark nodes being attacked by player as visible
   playerNodes.forEach((playerNode) => {
-    if (playerNode.current_target) {
-      visibleNodeIds.add(getNodeId(playerNode.current_target));
+    const targetCoord = extractTargetCoord(playerNode.current_target);
+    if (targetCoord) {
+      visibleNodeIds.add(getNodeId(targetCoord));
     }
   });
 
@@ -176,13 +192,19 @@ function deriveEdges(
   const edges = new Map<string, NetworkEdge>();
 
   nodes.forEach((node) => {
-    // Skip nodes with no target
-    if (!node.current_target || node.owner_id === null) {
+    // Skip nodes with no target or owner
+    if (node.owner_id === null) {
       return;
     }
 
+    // Extract coordinate from AttackTarget enum
+    const targetCoord = extractTargetCoord(node.current_target);
+    if (!targetCoord) {
+      return; // No coordinate target (could be Player attack or null)
+    }
+
     const sourceId = getNodeId(node.coord);
-    const targetId = getNodeId(node.current_target);
+    const targetId = getNodeId(targetCoord);
 
     // Only create edge if source or target is visible
     if (!visibilitySet.has(sourceId) && !visibilitySet.has(targetId)) {

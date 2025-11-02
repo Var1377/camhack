@@ -4,6 +4,7 @@
  */
 
 import Phaser from 'phaser';
+import { LobbyScene } from './scenes/LobbyScene';
 import { GameScene } from './scenes/GameScene';
 import { GraphGameScene } from './scenes/GraphGameScene';
 import { UIScene } from './scenes/UIScene';
@@ -18,7 +19,7 @@ const config: Phaser.Types.Core.GameConfig = {
   height: 720,
   backgroundColor: '#0a0a1a',
   parent: 'app',
-  scene: USE_HEX_GRID ? [GameScene] : [GraphGameScene, UIScene],
+  scene: USE_HEX_GRID ? [LobbyScene, GameScene] : [LobbyScene, GraphGameScene, UIScene],
   physics: {
     default: 'arcade',
     arcade: {

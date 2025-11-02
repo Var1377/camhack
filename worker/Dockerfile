@@ -1,13 +1,12 @@
-# Multi-stage build with static linking (musl)
-FROM rust:alpine as builder
+# Multi-stage build using Debian Trixie (newer glibc for Fargate)
+FROM rust:slim as builder
 
 WORKDIR /app
 
-# Install build dependencies (musl has protobuf compiler available)
-RUN apk add --no-cache musl-dev protobuf-dev protoc
-
-# Add musl target for static linking
-RUN rustup target add x86_64-unknown-linux-musl
+# Install protobuf compiler for tonic-build
+RUN apt-get update && \
+    apt-get install -y protobuf-compiler && \
+    rm -rf /var/lib/apt/lists/*
 
 # Copy manifests and build script
 COPY Cargo.toml Cargo.lock build.rs ./
@@ -18,23 +17,25 @@ COPY proto ./proto
 # Create dummy main to cache dependencies
 RUN mkdir src && \
     echo "fn main() {}" > src/main.rs && \
-    cargo build --release --target x86_64-unknown-linux-musl && \
+    cargo build --release && \
     rm -rf src
 
 # Copy actual source code
 COPY src ./src
 
-# Build for release with musl (statically linked, no glibc dependency)
-RUN cargo build --release --target x86_64-unknown-linux-musl
+# Build for release
+RUN cargo build --release
 
-# Final minimal image - can use alpine or even scratch since binary is static
-FROM alpine:latest
+# Final runtime image - same Debian version as builder (Trixie/Testing)
+FROM debian:trixie-slim
 
-# Install minimal runtime dependencies (just for CA certs)
-RUN apk add --no-cache ca-certificates
+# Install minimal runtime dependencies
+RUN apt-get update && \
+    apt-get install -y ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
 
-# Copy statically linked binary from builder
-COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/worker /usr/local/bin/udp-node
+# Copy binary from builder
+COPY --from=builder /app/target/release/worker /usr/local/bin/udp-node
 
 # Expose ports
 EXPOSE 5000/tcp

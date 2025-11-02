@@ -4,11 +4,11 @@
   "requiresCompatibilities": ["FARGATE"],
   "cpu": "512",
   "memory": "1024",
-  "executionRoleArn": "arn:aws:iam::YOUR_ACCOUNT_ID:role/ecsTaskExecutionRole",
+  "executionRoleArn": "arn:aws:iam::267537957970:role/ecsTaskExecutionRole",
   "containerDefinitions": [
     {
       "name": "udp-node-capital",
-      "image": "YOUR_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/udp-node:latest",
+      "image": "267537957970.dkr.ecr.us-east-1.amazonaws.com/udp-node:latest",
       "essential": true,
       "portMappings": [
         {

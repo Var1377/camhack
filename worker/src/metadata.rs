@@ -100,13 +100,18 @@ pub async fn get_task_ip() -> Result<String> {
             println!("Detected task IP from ECS metadata: {}", ip);
             Ok(ip)
         }
-        Err(_) => {
-            // Fallback for local development
-            let fallback_ip = "127.0.0.1".to_string();
-            println!("⚠️  ECS metadata not available (local development mode)");
-            println!("   Using fallback IP: {}", fallback_ip);
-            println!("   Set NODE_IP environment variable to override");
-            Ok(fallback_ip)
+        Err(e) => {
+            Err(anyhow::anyhow!(
+                "Failed to detect IP address.\n\
+                 ECS metadata endpoint unavailable and NODE_IP environment variable not set.\n\
+                 \n\
+                 For local development, you must set NODE_IP:\n\
+                   export NODE_IP=$(hostname -I | awk '{{print $1}}')\n\
+                 \n\
+                 Or set it manually to your machine's IP address.\n\
+                 \n\
+                 Original error: {}", e
+            ))
         }
     }
 }

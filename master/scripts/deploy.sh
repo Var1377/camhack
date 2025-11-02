@@ -124,6 +124,9 @@ python3 -c "
 import json
 import sys
 
+subnet_id = sys.argv[1]
+security_group_id = sys.argv[2]
+
 with open('/tmp/master-task-definition-updated.json', 'r') as f:
     task_def = json.load(f)
 
@@ -131,13 +134,13 @@ with open('/tmp/master-task-definition-updated.json', 'r') as f:
 for container in task_def['containerDefinitions']:
     for env in container['environment']:
         if env['name'] == 'SUBNET_ID':
-            env['value'] = '$SUBNET_ID'
+            env['value'] = subnet_id
         elif env['name'] == 'SECURITY_GROUP_ID':
-            env['value'] = '$SECURITY_GROUP_ID'
+            env['value'] = security_group_id
 
 with open('/tmp/master-task-definition-updated.json', 'w') as f:
     json.dump(task_def, f, indent=2)
-"
+" "$SUBNET_ID" "$SECURITY_GROUP_ID"
 
 # Register task definition
 echo "Registering task definition..."
