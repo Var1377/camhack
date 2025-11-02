@@ -13,6 +13,7 @@ use futures_util::SinkExt;
 use openraft::Raft;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tower_http::cors::CorsLayer;
 
 /// HTTP API state shared across handlers
 #[derive(Clone)]
@@ -114,6 +115,8 @@ pub struct NodeInfo {
     pub coord: NodeCoord,
     pub owner_id: u64,
     pub current_target: Option<AttackTarget>,
+    pub bandwidth_in: Option<u64>,
+    pub packet_loss: Option<f32>,
 }
 
 /// Create the HTTP API router
@@ -130,6 +133,7 @@ pub fn create_router(state: ApiState) -> Router {
         .route("/game/state", get(handle_get_game_state))
         // WebSocket attack endpoint
         .route("/attack", get(handle_attack))
+        .layer(CorsLayer::permissive())  // Enable CORS for frontend
         .with_state(state)
 }
 
@@ -500,10 +504,17 @@ async fn handle_get_game_state(State(state): State<ApiState>) -> impl IntoRespon
         .game_state
         .nodes
         .values()
-        .map(|n| NodeInfo {
-            coord: n.coord,
-            owner_id: n.owner_id,
-            current_target: n.current_target,
+        .map(|n| {
+            // Get metrics for this node if available
+            let metrics = sm.game_state.node_metrics.get(&n.coord);
+
+            NodeInfo {
+                coord: n.coord,
+                owner_id: n.owner_id,
+                current_target: n.current_target,
+                bandwidth_in: metrics.map(|m| m.bandwidth_in),
+                packet_loss: metrics.map(|m| m.packet_loss),
+            }
         })
         .collect();
 

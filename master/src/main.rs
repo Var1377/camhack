@@ -8,6 +8,7 @@ use axum::{
 use aws_sdk_ecs::Client as EcsClient;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::Write;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -120,7 +121,8 @@ struct SpawnSingleNodeResponse {
 
 #[tokio::main]
 async fn main() {
-    println!("Master node starting...");
+    eprintln!("=== MASTER NODE STARTING ===");
+    std::io::stderr().flush().unwrap();
 
     // Load AWS configuration
     let config = aws_config::load_from_env().await;

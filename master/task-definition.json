@@ -31,6 +31,10 @@
           "value": "udp-node"
         },
         {
+          "name": "CAPITAL_TASK_DEFINITION",
+          "value": "udp-node-capital"
+        },
+        {
           "name": "SUBNET_ID",
           "value": "WILL_BE_SET_BY_DEPLOY_SCRIPT"
         },

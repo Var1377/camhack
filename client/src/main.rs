@@ -26,8 +26,7 @@ async fn main() -> Result<()> {
     println!("=== CamHack Client Starting ===\n");
 
     // Get master URL from environment
-    let master_url = std::env::var("MASTER_URL")
-        .unwrap_or_else(|_| "http://localhost:8080".to_string());
+    let master_url = std::env::var("MASTER_URL").expect("no master url set");
     println!("Master URL: {}", master_url);
 
     // Create client state with no initial Raft node or player
@@ -112,6 +111,7 @@ async fn start_api_server(state: ClientState, addr: String) -> Result<()> {
         Json, Router,
     };
     use serde::{Deserialize, Serialize};
+    use tower_http::cors::CorsLayer;
 
     #[derive(Serialize)]
     struct PlayerStatusResponse {
@@ -520,6 +520,7 @@ async fn start_api_server(state: ClientState, addr: String) -> Result<()> {
         .route("/my/attack", post(set_attack_target))
         .route("/ws", get(websocket_handler))
         .route("/finalkill", get(finalkill_handler))
+        .layer(CorsLayer::permissive())  // Enable CORS for frontend
         .with_state(state);
 
     // Start server

@@ -159,10 +159,44 @@ EXISTING_TASKS=$(aws ecs list-tasks \
   --output text)
 
 if [ -n "$EXISTING_TASKS" ]; then
-  echo "WARNING: Master node is already running!"
+  echo "⚠️  Master node is already running"
   echo "Task ARN: $EXISTING_TASKS"
-  echo "Stop it first with: aws ecs stop-task --cluster $CLUSTER_NAME --task $EXISTING_TASKS"
-  exit 1
+  echo ""
+  read -p "Stop and restart with new image? (y/N): " -n 1 -r
+  echo ""
+  if [[ $REPLY =~ ^[Yy]$ ]]; then
+    echo "Stopping existing master task..."
+    aws ecs stop-task \
+      --cluster $CLUSTER_NAME \
+      --task $EXISTING_TASKS \
+      --region $AWS_REGION \
+      --output text > /dev/null
+
+    echo "Waiting for task to stop..."
+    sleep 10
+
+    # Verify it stopped
+    STILL_RUNNING=$(aws ecs list-tasks \
+      --cluster $CLUSTER_NAME \
+      --family master-node \
+      --desired-status RUNNING \
+      --region $AWS_REGION \
+      --query 'taskArns[]' \
+      --output text)
+
+    if [ -n "$STILL_RUNNING" ]; then
+      echo "⚠️  Task still stopping, waiting 10 more seconds..."
+      sleep 10
+    fi
+
+    echo "✓ Old master stopped"
+  else
+    echo "Keeping existing master. Exiting."
+    echo ""
+    echo "To get the master IP:"
+    echo "  ./scripts/get-ip.sh"
+    exit 0
+  fi
 fi
 
 # Run the master task
